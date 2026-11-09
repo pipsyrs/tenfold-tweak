@@ -1,0 +1,26 @@
+#!/bin/sh
+# Open the Tenfold Tweak GUI straight from the project dir (no install needed).
+DIR=$(dirname "$(readlink -f "$0")")
+TITLE="Tenfold Tweak"
+
+# Print the problem; also show it as a dialog when started without a terminal (double-click).
+fail() {
+    echo "tenfold-tweak: $1" >&2
+    if [ ! -t 1 ]; then
+        zenity --error --no-markup --title="$TITLE" --width=420 --text="$1" 2>/dev/null ||
+            notify-send "$TITLE" "$1" 2>/dev/null
+    fi
+    exit 1
+}
+
+[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] ||
+    fail "no graphical display found; use the command line: $DIR/tenfold-tweak --help"
+command -v python3 >/dev/null 2>&1 ||
+    fail "python3 is not installed. Install it with: sudo apt install python3"
+python3 -I -c 'import gi; gi.require_version("Gio", "2.0"); gi.require_version("GdkPixbuf", "2.0"); from gi.repository import Gio, GdkPixbuf' 2>/dev/null ||
+    fail "PyGObject (GTK bindings) is missing. Install it with: sudo apt install python3-gi gir1.2-gdkpixbuf-2.0"
+# GUI toolkit check: keep in sync with tenfold_tweak/gui.py (GTK 4; libadwaita is optional).
+python3 -I -c 'import gi; gi.require_version("Gtk", "4.0"); from gi.repository import Gtk' 2>/dev/null ||
+    fail "GTK 4 for Python is missing. Install it with: sudo apt install gir1.2-gtk-4.0 (optional: gir1.2-adw-1)"
+
+exec python3 "$DIR/tenfold-tweak" gui

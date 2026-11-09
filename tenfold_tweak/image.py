@@ -1,0 +1,158 @@
+"""Image validation and the stable per-user copy used by all targets."""
+
+import hashlib
+import os
+import stat
+import tempfile
+
+import gi
+
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import GdkPixbuf, GLib  # noqa: E402
+
+MAX_SIZE = 64 * 1024 * 1024
+MAX_DIM = 16384
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+JPEG_MAGIC = b"\xff\xd8\xff"
+COPY_DIR = os.path.join(
+    os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"),
+    "backgrounds", "tenfold-tweak")
+# Copies made under the tool's old name; still cleaned up once nothing references them.
+LEGACY_COPY_DIR = os.path.join(os.path.dirname(COPY_DIR), "kali-bg-changer")
+COPY_PREFIX = "wallpaper-"
+LOGIN_PREFIX = "login-"
+# Login images are decoded in full by the greeter; keep in sync with root_helper.MAX_LOGIN_DIM.
+LOGIN_MAX_DIM = 4096
+
+
+class ImageError(Exception):
+    pass
+
+
+def _read_source(path: str) -> bytes:
+    real = os.path.realpath(path)
+    if not os.path.exists(real):
+        raise ImageError(f"file not found: {path}")
+    try:
+        fd = os.open(real, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as e:
+        raise ImageError(f"cannot read {path}: {e.strerror}") from None
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise ImageError(f"not a regular file: {path}")
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not 0 < st.st_size <= MAX_SIZE:
+            raise ImageError("image size must be between 1 byte and 64 MiB")
+        try:
+            data = f.read(MAX_SIZE + 1)
+        except OSError as e:
+            raise ImageError(f"cannot read {path}: {e.strerror}") from None
+    if not 0 < len(data) <= MAX_SIZE:
+        raise ImageError("image size must be between 1 byte and 64 MiB")
+    return data
+
+
+def _ext_for(data: bytes) -> str:
+    if data.startswith(PNG_MAGIC):
+        return "png"
+    if data.startswith(JPEG_MAGIC):
+        return "jpg"
+    raise ImageError("unsupported format; supported: PNG, JPEG")
+
+
+def _short(err: GLib.Error) -> str:
+    # Loader errors can carry long source-location prefixes; keep the last part.
+    return err.message.rsplit(": ", 1)[-1].strip() or "cannot decode"
+
+
+def _check_decodes(path: str, ext: str):
+    try:
+        fmt, width, height = GdkPixbuf.Pixbuf.get_file_info(path)
+    except GLib.Error as e:
+        raise ImageError(f"corrupt image: {_short(e)}") from None
+    expected = "png" if ext == "png" else "jpeg"
+    if fmt is None:
+        # Magic bytes already matched, so an unrecognised file is damaged.
+        raise ImageError("corrupt image: cannot read image header")
+    if fmt.get_name() != expected:
+        raise ImageError("unsupported format; supported: PNG, JPEG")
+    if not (1 <= width <= MAX_DIM and 1 <= height <= MAX_DIM):
+        raise ImageError(f"image dimensions must be between 1 and {MAX_DIM} pixels")
+    try:
+        # Bounded-memory full decode catches truncated/corrupt data.
+        GdkPixbuf.Pixbuf.new_from_file_at_scale(path, 256, 256, True)
+    except GLib.Error as e:
+        raise ImageError(f"corrupt image: {_short(e)}") from None
+
+
+def prepare(path: str) -> str:
+    """Validate the image and return the path of its stable user copy."""
+    data = _read_source(path)
+    ext = _ext_for(data)
+    os.makedirs(COPY_DIR, mode=0o700, exist_ok=True)
+    os.chmod(COPY_DIR, 0o700)
+    final = os.path.join(COPY_DIR, f"{COPY_PREFIX}{hashlib.sha256(data).hexdigest()[:12]}.{ext}")
+    fd, tmp = tempfile.mkstemp(prefix=".incoming-", suffix="." + ext, dir=COPY_DIR)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fchmod(f.fileno(), 0o600)
+            os.fsync(f.fileno())
+        _check_decodes(tmp, ext)
+        os.replace(tmp, final)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    return final
+
+
+def login_copy(path: str) -> str:
+    """Return path, or a copy downscaled to fit LOGIN_MAX_DIM, for the login target."""
+    try:
+        _, width, height = GdkPixbuf.Pixbuf.get_file_info(path)
+        if width <= LOGIN_MAX_DIM and height <= LOGIN_MAX_DIM:
+            return path
+        pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, LOGIN_MAX_DIM, LOGIN_MAX_DIM, True)
+    except GLib.Error as e:
+        raise ImageError(f"cannot downscale image for the login screen: {_short(e)}") from None
+    ext = path.rsplit(".", 1)[-1]
+    final = os.path.join(COPY_DIR, LOGIN_PREFIX + os.path.basename(path)[len(COPY_PREFIX):])
+    fd, tmp = tempfile.mkstemp(prefix=".incoming-", suffix="." + ext, dir=COPY_DIR)
+    os.close(fd)
+    try:
+        if ext == "png":
+            pixbuf.savev(tmp, "png", [], [])
+        else:
+            pixbuf.savev(tmp, "jpeg", ["quality"], ["92"])
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, final)
+    except GLib.Error as e:
+        raise ImageError(f"cannot downscale image for the login screen: {_short(e)}") from None
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    return final
+
+
+def cleanup_copies(keep: set):
+    """Delete tool-owned copies not in keep (paths still referenced by settings)."""
+    keep = {os.path.realpath(p) for p in keep if p}
+    for directory in (COPY_DIR, LEGACY_COPY_DIR):
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(directory, name)
+            if name.startswith((COPY_PREFIX, LOGIN_PREFIX, ".incoming-")) and os.path.realpath(path) not in keep:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+    try:
+        os.rmdir(LEGACY_COPY_DIR)  # only succeeds once empty
+    except OSError:
+        pass
