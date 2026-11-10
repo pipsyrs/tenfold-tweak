@@ -1,0 +1,25 @@
+#!/bin/sh
+# tenfold-tweaks postrm: purge system traces (saved images kept); undo the preinst migration on abort.
+set -e
+
+#COMMON#
+
+case "$1" in
+    remove)
+        rm -rf -- "$TT_R/usr/share/tenfold-tweaks/__pycache__" "$TT_R/usr/share/tenfold-tweaks/tenfold_tweak/__pycache__"
+        rmdir -- "$TT_R/usr/share/tenfold-tweaks/tenfold_tweak" "$TT_R/usr/share/tenfold-tweaks" 2>/dev/null || true
+        ;;
+    purge)
+        tt_purge
+        ;;
+    abort-install | abort-upgrade)
+        tt_unmigrate_legacy
+        ;;
+    upgrade | failed-upgrade | disappear) ;;
+    *)
+        echo "postrm called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

@@ -169,8 +169,8 @@ class PkexecTest(Base):
     def test_command_shape(self):
         core.run("apply", self.img, ["login"], lambda m: True, GNOME_GDM)
         cmd = self.cmds[0]
-        self.assertEqual(cmd[:5], [system.PKEXEC, system.PYTHON, "-I", system.HELPER, "gdm-apply"])
-        self.assertTrue(cmd[5].startswith(image.COPY_DIR))
+        self.assertEqual(cmd[:3], [system.PKEXEC, system.HELPER, "gdm-apply"])
+        self.assertTrue(cmd[3].startswith(image.COPY_DIR))
 
     def test_cancel_126_and_127_change_nothing(self):
         for rc in (126, 127):

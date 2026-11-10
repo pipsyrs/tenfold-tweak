@@ -14,9 +14,10 @@ gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib  # noqa: E402
 
 STATE_DIR = os.path.join(
-    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "tenfold-tweak")
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "tenfold-tweaks")
 BACKUP_FILE = os.path.join(STATE_DIR, "backup.json")
-LEGACY_STATE_DIR = os.path.join(os.path.dirname(STATE_DIR), "kali-bg-changer")
+# State dir used before the rename; moved by migrate.migrate_user().
+LEGACY_STATE_DIR = os.path.join(os.path.dirname(STATE_DIR), "tenfold-tweak")
 
 GNOME_SCHEMA = "org.gnome.desktop.background"
 GNOME_KEYS = ("picture-uri", "picture-uri-dark", "picture-options")
@@ -40,21 +41,7 @@ class DesktopError(Exception):
 
 # ---------- backup file ----------
 
-def _migrate_legacy_backup():
-    """Move the backup written under the tool's old name, once."""
-    legacy = os.path.join(LEGACY_STATE_DIR, "backup.json")
-    if os.path.exists(BACKUP_FILE) or not os.path.isfile(legacy) or os.path.islink(legacy):
-        return
-    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
-    try:
-        os.replace(legacy, BACKUP_FILE)
-        os.rmdir(LEGACY_STATE_DIR)
-    except OSError:
-        pass
-
-
 def load_backup() -> dict:
-    _migrate_legacy_backup()
     try:
         with open(BACKUP_FILE, encoding="utf-8") as f:
             data = json.load(f)
@@ -526,6 +513,74 @@ def current_images(de: str, lock_provider: str | None = None, lock_dir: str | No
         wall = paths[0] if paths else None
         return {"desktop": wall, "lock": wall}
     return {"desktop": None, "lock": None}
+
+
+def _relocated(value, old_dir: str, new_dir: str):
+    """value (path or file:// URI) moved from old_dir to new_dir; None when not inside old_dir."""
+    path = _uri_path(value) if isinstance(value, str) else None
+    old = old_dir.rstrip("/") + "/"
+    if not path or not path.startswith(old):
+        return None
+    new = os.path.join(new_dir, path[len(old):])
+    return new if value.startswith("/") else Gio.File.new_for_path(new).get_uri()
+
+
+def _relocate_values(data, old_dir: str, new_dir: str):
+    """(data with relocated strings, count) for nested backup values."""
+    if isinstance(data, dict):
+        out, n = {}, 0
+        for k, v in data.items():
+            out[k], c = _relocate_values(v, old_dir, new_dir)
+            n += c
+        return out, n
+    new = _relocated(data, old_dir, new_dir)
+    return (data, 0) if new is None else (new, 1)
+
+
+def relocate(de: str, old_dir: str, new_dir: str, lock_dir: str | None = None) -> int:
+    """Point every setting and backup value inside old_dir at new_dir; all rolled back on failure."""
+    undo, count = [], 0
+    try:
+        if de == "gnome":
+            gnome = [_gnome_settings()]
+            saved = load_backup().get("gnome-lock")
+            saved_dir = saved.get("dir") if isinstance(saved, dict) and isinstance(saved.get("dir"), str) else None
+            for uuid in LOCK_EXTENSIONS:
+                gnome += [s for d in {lock_dir, saved_dir, None} if (s := _lock_settings(uuid, d)) is not None]
+            for s in gnome:
+                snapshot = _gnome_state(s)
+                values = dict(snapshot)
+                for k in ("picture-uri", "picture-uri-dark"):
+                    new = _relocated(values[k], old_dir, new_dir)
+                    if new is not None:
+                        values[k] = new
+                if values != snapshot:
+                    undo.append(lambda s=s, v=snapshot: _gnome_write(s, v))
+                    _gnome_write(s, values)
+                    count += sum(values[k] != snapshot[k] for k in GNOME_KEYS)
+        elif de == "xfce":
+            props = [p.strip() for p in (_xfconf("-l", check=False) or "").splitlines() if XFCE_PROP_RE.match(p.strip())]
+            snapshot = {p: _xfce_get(p) for p in props}
+            changes = {p: n for p, v in snapshot.items() if (n := _relocated(v, old_dir, new_dir)) is not None}
+            if changes:
+                undo.append(lambda v={p: snapshot[p] for p in changes}: _xfce_write(v))
+                _xfce_write(changes)
+                count += len(changes)
+        else:
+            raise DesktopError(f"unsupported desktop environment {de}")
+        backup = load_backup()
+        moved, n = _relocate_values(backup, old_dir, new_dir)
+        if n:
+            save_backup(moved)
+            count += n
+    except Exception:
+        for step in reversed(undo):
+            try:
+                step()
+            except Exception:
+                pass
+        raise
+    return count
 
 
 def has_backup(section: str) -> bool:

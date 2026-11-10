@@ -22,57 +22,93 @@ Each target can be restored. The tool keeps a backup of the original settings an
 | XFCE desktop (xfconf / xfdesktop) | best-effort, unit-tested only | |
 | XFCE lock (xfce4-screensaver) | best-effort | Shows the desktop wallpaper, so lock sets the desktop wallpaper. |
 | LightDM with lightdm-gtk-greeter | best-effort, unit-tested only | Other LightDM greeters are not supported. |
-| KDE, other DEs, SDDM, other DMs | not supported | `tenfold-tweak detect` shows the reason. |
+| KDE, other DEs, SDDM, other DMs | not supported | `tenfold-tweaks detect` shows the reason. |
 
-Other Debian-based distros with the same DE and DM may work, but they are untested.
+### Supported operating systems
+
+| OS | Status | Reason |
+|----|--------|--------|
+| Kali Linux (rolling) | tested | |
+| Other Debian-based distros with apt, dpkg and systemd, e.g. Debian 12+, Ubuntu 22.04+ and derivatives | should work, untested | The `.deb` (`Architecture: all`) needs Python 3.10+, `gir1.2-gtk-4.0` and dpkg 1.19.2+, which these releases ship. Only the DE/DM combinations above apply. If libadwaita is older than 1.5, the GUI runs without it. |
+| Non-Debian Linux (Fedora, Arch, openSUSE, ...) | not supported | Packaged only as `.deb`; install and the login target rely on apt/dpkg and `dpkg-divert`. |
+| Windows, macOS | not supported | Linux desktop (GNOME/XFCE, GDM3/LightDM) only. |
+
+The `clean` categories `--apt-cache` and `--autoremove` need apt, and `--journal` needs systemd-journald (`journalctl`).
 
 ## Requirements
 
 - Python 3.10+, PyGObject: `python3-gi gir1.2-gdkpixbuf-2.0` (preinstalled on Kali desktops)
 - GUI: GTK 4 bindings, `gir1.2-gtk-4.0` (with `python3-gi`). Optional: `gir1.2-adw-1` (libadwaita 1.5 or later). zenity is no longer required.
-- Login target: `pkexec` (polkit), and running `sudo ./install.sh` once
+- Login target: `pkexec` (polkit) and the installed package
 - XFCE: `xfconf-query` (part of xfconf)
 
 No pip packages are needed.
 
 ## Install
 
-Desktop and lock work straight from the project directory. Installing is required only for the login target, because the root helper must be a root-owned copy:
+Desktop and lock work straight from the project directory. The login target needs the package, because the root helper must be root-owned.
+
+Build the .deb (needs only `dpkg-deb`, preinstalled on Kali; no debhelper or fakeroot):
+
+1. Set the version in `packaging/VERSION`. To upgrade an installed package, bump it first (e.g. `2.0.1`).
+2. Build: `sh packaging/build-deb.sh` writes `dist/tenfold-tweaks_<version>_all.deb`. Every module in `tenfold_tweak/` must be listed in `MODULES` in `packaging/build-deb.sh`; otherwise the build fails on purpose.
+3. Install with the full file name (`dist/` can hold several versions, so avoid `*.deb`):
 
 ```sh
-sudo ./install.sh
+sh packaging/build-deb.sh
+sudo apt install ./dist/tenfold-tweaks_2.0.0_all.deb
 ```
 
-This installs to `/usr/local/lib/tenfold-tweak` and creates the `/usr/local/bin/tenfold-tweak` command and an app-menu entry "Tenfold Tweak". If an older install named `kali-bg-changer` exists, the installer undoes its login change, removes its files and re-applies the same login image with the new helper. If that image cannot be kept, it stops without changing anything. Run `sudo ./install.sh --discard-login` to reset the login background and continue.
+To upgrade, build a higher version and `apt install` it over the old one.
+
+This installs the `tenfold-tweaks` command and the app-menu entry "Tenfold Tweaks". An older `sudo ./install.sh` install (`tenfold-tweak`) is migrated automatically: the active login image stays, its files are removed, and if anything fails the install is cancelled with nothing changed. A login image the old install kept as `migrated-login` is saved in `/var/backups/tenfold-tweaks/`.
 
 ## Usage
 
 GUI, no install needed (double-click it, or run it from a terminal):
 
 ```sh
-./tenfold-tweak-gui
+./tenfold-tweaks-gui
 ```
 
 CLI:
 
 ```sh
-./tenfold-tweak detect                         # environment and available targets
-./tenfold-tweak status                         # current image and restore state per target
-./tenfold-tweak apply ~/Pictures/bg.jpg --desktop --lock
-./tenfold-tweak apply ~/Pictures/bg.png --login
-./tenfold-tweak apply ~/Pictures/bg.png --all --yes
-./tenfold-tweak restore --all
+./tenfold-tweaks detect                         # environment and available targets
+./tenfold-tweaks status                         # current image and restore state per target
+./tenfold-tweaks apply ~/Pictures/bg.jpg --desktop --lock
+./tenfold-tweaks apply ~/Pictures/bg.png --login
+./tenfold-tweaks apply ~/Pictures/bg.png --all --yes
+./tenfold-tweaks restore --all
 ```
 
 Images must be PNG or JPEG. Login images larger than 4096x4096 are downscaled. A login change shows after you log out or reboot.
 
 If the login screen ever breaks on GNOME: press Ctrl+Alt+F3, log in, then run `sudo apt install --reinstall gnome-shell-common`.
 
+## Clean up
+
+Frees disk space (not RAM). In the GUI, open the "Clean up" page, tick the categories and confirm. CLI:
+
+```sh
+tenfold-tweaks clean                            # default categories: preview, then asks before deleting
+tenfold-tweaks clean --cache --trash --defaults --yes
+```
+
+Categories: `--apt-cache`, `--journal` (logs older than 7 days), `--thumbnails`, `--tool-images` (unused Tenfold Tweaks images) are the defaults; `--cache` (~/.cache), `--trash` and `--autoremove` (orphan packages) are opt-in. Without category flags the defaults are used; `--defaults` adds them to the selected ones. `clean` always prints a preview (size per category and total) first, then asks for confirmation (`[y/N]`) when run in a terminal; `--yes` skips the question. Without `--yes` and without a terminal (scripts, pipes, cron) it only previews and prints `nothing deleted; re-run with --yes`. APT cache, journal, tool images and autoremove need admin rights (asked once).
+
 ## Uninstall
 
 ```sh
-tenfold-tweak restore --login     # required first if a login change is active
-sudo ./install.sh --uninstall
+sudo apt remove tenfold-tweaks    # restores the stock login screen; the active login image is saved first
+sudo apt purge tenfold-tweaks     # also deletes /var/lib/tenfold-tweaks
 ```
 
-To drop your desktop and lock-screen backups as well, run `tenfold-tweak restore --desktop --lock` first, then remove `~/.local/state/tenfold-tweak` and `~/.local/share/backgrounds/tenfold-tweak`.
+Saved login images stay in `/var/backups/tenfold-tweaks/` (readable without admin rights; purge keeps them) and their paths are printed. If the login screen cannot be restored safely, the remove stops and the package stays installed.
+
+Full removal:
+
+1. `tenfold-tweaks restore --desktop --lock` (the package never touches your home directory, so undo desktop and lock first)
+2. `sudo apt purge tenfold-tweaks`
+3. `rm -rf ~/.local/state/tenfold-tweaks ~/.local/share/backgrounds/tenfold-tweaks`
+4. Optional: `sudo rm -rf /var/backups/tenfold-tweaks` (saved login images; purge keeps them)

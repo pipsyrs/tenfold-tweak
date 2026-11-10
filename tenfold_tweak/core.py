@@ -1,11 +1,11 @@
 """Shared apply/restore flow used by the CLI and the GUI."""
 
 import os
-import subprocess
+import sys
 from dataclasses import dataclass
 from typing import Callable
 
-from . import desktop, detect, image, system
+from . import desktop, detect, image, migrate, system
 from .image import ImageError  # noqa: F401  (re-exported for front ends)
 
 TARGETS = detect.TARGETS
@@ -55,26 +55,13 @@ class TargetStatus:
     method: str = ""             # how this target is changed, human-readable
     current: str | None = None   # image file shown now; None when unknown or embedded
     restorable: bool = False     # a backup exists, so restore would change something
-    setup_required: bool = False  # blocked only by the missing/outdated root helper (install_system fixes it)
+    setup_required: bool = False  # blocked only by the missing/outdated root helper (package install fixes it)
 
 
 @dataclass
 class SetupState:
     installed: bool       # root helper installed, secure and current
-    can_install: bool     # install_system() can run (source tree with install.sh + pkexec)
-    can_uninstall: bool   # uninstall_system() can run
-    reason: str = ""      # why not installed / why it cannot be (un)installed; "" when all fine
-
-
-@dataclass
-class SetupResult:
-    ok: bool
-    message: str = ""
-    needs_discard_login: bool = False  # retry install_system(discard_login=True) after asking the user
-
-
-EXIT_NEEDS_DISCARD_LOGIN = 4  # install.sh: old login image cannot be kept
-SETUP_CANCELLED = "Administrator authorization was cancelled or denied; nothing was changed."
+    reason: str = ""      # why not installed; "" when all fine
 
 
 # confirm(message) -> True (yes), False (declined), None (cannot ask)
@@ -128,6 +115,16 @@ def _run_login(action: str, dm: str, copy: str | None) -> tuple:
         return FAILED, str(e) or type(e).__name__
 
 
+def _migrate(env: detect.Environment):
+    """Move per-user state from the old tool name once; never blocks the action."""
+    try:
+        warnings = migrate.migrate_user(env.de, env.lock_provider_dir)
+    except Exception as e:
+        warnings = [f"user data migration failed: {e}"]
+    for w in warnings:
+        print(f"warning: {w}", file=sys.stderr)
+
+
 def _cleanup(env: detect.Environment):
     if env.de not in ("gnome", "xfce"):
         return
@@ -147,6 +144,7 @@ def run(action: str, image_path: str | None, targets, confirm: ConfirmFn,
     if not selected <= set(TARGETS):
         raise ValueError(f"unknown target(s): {', '.join(sorted(selected - set(TARGETS)))}")
     env = env or detect.detect()
+    _migrate(env)
 
     results = {}
     for t in TARGETS:
@@ -197,6 +195,7 @@ def run(action: str, image_path: str | None, targets, confirm: ConfirmFn,
 def status(env: detect.Environment | None = None) -> list:
     """Read-only state per target (TargetStatus in TARGETS order) for front ends."""
     env = env or detect.detect()
+    _migrate(env)
     images = {"desktop": None, "lock": None}
     if env.de in ("gnome", "xfce"):
         try:
@@ -228,50 +227,9 @@ def status(env: detect.Environment | None = None) -> list:
 
 
 def setup_state() -> SetupState:
-    """Whether the one-time root setup (needed by the login target) is done or can be done."""
+    """Whether the root helper (installed by the tenfold-tweaks package) is present and current."""
     problem = system.setup_problem()
-    pkexec = os.access(system.PKEXEC, os.X_OK)
-    can_install = pkexec and system.install_script() is not None
-    can_uninstall = pkexec and os.path.isdir(system.INSTALL_LIB) and system.install_script(True) is not None
     reason = problem or ""
-    if not pkexec:
-        reason = (reason + "; " if reason else "") + "pkexec not found (install policykit-1)"
-    elif problem and not can_install:
-        reason += "; install.sh not found next to this program"
-    return SetupState(problem is None, can_install, can_uninstall, reason)
-
-
-def _setup_result(rc: int, stdout: str, stderr: str) -> SetupResult:
-    """Map install.sh/pkexec exit codes to a SetupResult."""
-    text = "\n".join(ln.strip() for ln in (stdout + "\n" + stderr).splitlines() if ln.strip())
-    errors = "\n".join(ln.strip() for ln in stderr.splitlines() if ln.strip())
-    if rc == 0:
-        return SetupResult(True, text)
-    if rc in (126, 127):
-        return SetupResult(False, SETUP_CANCELLED)
-    if rc == EXIT_NEEDS_DISCARD_LOGIN:
-        return SetupResult(False, errors, needs_discard_login=True)
-    return SetupResult(False, errors or f"install.sh exited with {rc}")
-
-
-def _run_setup(script: str | None, args: list) -> SetupResult:
-    if script is None:
-        return SetupResult(False, "install.sh not found next to this program")
     if not os.access(system.PKEXEC, os.X_OK):
-        return SetupResult(False, "pkexec not found (install policykit-1)")
-    try:
-        return _setup_result(*system.run_install_script(script, args))
-    except subprocess.TimeoutExpired:
-        return SetupResult(False, "install.sh timed out")
-    except OSError as e:
-        return SetupResult(False, f"cannot run pkexec: {e.strerror}")
-
-
-def install_system(discard_login: bool = False) -> SetupResult:
-    """Install/update the root-owned copy via pkexec install.sh. Blocks; call off the UI thread."""
-    return _run_setup(system.install_script(), ["--discard-login"] if discard_login else [])
-
-
-def uninstall_system() -> SetupResult:
-    """Remove the root-owned copy via pkexec install.sh --uninstall. Blocks; call off the UI thread."""
-    return _run_setup(system.install_script(for_uninstall=True), ["--uninstall"])
+        reason = (reason + "; " if reason else "") + "pkexec not found (install policykit-1)"
+    return SetupState(problem is None, reason)

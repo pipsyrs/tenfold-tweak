@@ -1,6 +1,5 @@
-"""Legacy (kali-bg-changer) backup/copy migration and the read-only core.status()."""
+"""Cleanup of copies under the old tool name (tenfold-tweak), leftover old names, and core.status()."""
 
-import json
 import os
 import shutil
 import unittest
@@ -10,7 +9,7 @@ from tests import SANDBOX
 from tests.helpers import make_image, scratch_dir, write
 from tests.test_desktop import gnome, reset_state
 
-from tenfold_tweak import core, desktop, detect, image
+from tenfold_tweak import core, desktop, detect, image, migrate
 
 UUID = next(iter(desktop.LOCK_EXTENSIONS))
 LOGIN = {"method": "Kali login image (dpkg-divert)", "current": "/x/login", "restorable": False}
@@ -22,47 +21,10 @@ def env(de="gnome", dm="gdm3", provider=None, unavailable=None):
     return detect.Environment(de, dm, u, lock_provider=provider)
 
 
-class LegacyBackupTest(unittest.TestCase):
-    def setUp(self):
-        self.assertTrue(desktop.LEGACY_STATE_DIR.startswith(SANDBOX))
-        self.assertTrue(desktop.LEGACY_STATE_DIR.endswith("/kali-bg-changer"))
-        reset_state()
-        self.addCleanup(reset_state)
-        self.addCleanup(shutil.rmtree, desktop.LEGACY_STATE_DIR, True)
-        self.legacy = os.path.join(desktop.LEGACY_STATE_DIR, "backup.json")
-
-    def test_legacy_backup_moved_once_and_old_dir_removed(self):
-        data = {"gnome": {"picture-uri": "file:///old.png", "picture-uri-dark": None, "picture-options": None}}
-        write(self.legacy, json.dumps(data).encode())
-        self.assertEqual(desktop.load_backup(), data)
-        self.assertFalse(os.path.exists(desktop.LEGACY_STATE_DIR))
-        self.assertTrue(desktop.has_backup("gnome"))
-        self.assertEqual(os.stat(desktop.STATE_DIR).st_mode & 0o777, 0o700)
-
-    def test_existing_new_backup_wins_and_legacy_untouched(self):
-        desktop.save_backup({"gnome": {"picture-uri": "file:///new.png"}})
-        write(self.legacy, b'{"gnome": {"picture-uri": "file:///old.png"}}')
-        self.assertEqual(desktop.load_backup()["gnome"]["picture-uri"], "file:///new.png")
-        self.assertTrue(os.path.isfile(self.legacy))
-
-    def test_symlinked_legacy_backup_ignored(self):
-        target = write(os.path.join(scratch_dir(), "elsewhere.json"), b'{"gnome": {"x": 1}}')
-        os.makedirs(desktop.LEGACY_STATE_DIR, exist_ok=True)
-        os.symlink(target, self.legacy)
-        self.assertEqual(desktop.load_backup(), {})
-        self.assertFalse(os.path.exists(desktop.BACKUP_FILE))
-        self.assertTrue(os.path.islink(self.legacy))
-
-    def test_migrated_legacy_backup_restores_desktop(self):
-        write(self.legacy, json.dumps({"gnome": {k: None for k in desktop.GNOME_KEYS}}).encode())
-        gnome().set_string("picture-uri", "file:///changed.png")
-        self.assertTrue(desktop.restore("gnome"))
-        self.assertFalse(gnome().get_user_value("picture-uri"))
-
-
 class LegacyCopiesTest(unittest.TestCase):
     def setUp(self):
         self.assertTrue(image.LEGACY_COPY_DIR.startswith(SANDBOX))
+        self.assertTrue(image.LEGACY_COPY_DIR.endswith("/backgrounds/tenfold-tweak"))
         self.addCleanup(shutil.rmtree, image.LEGACY_COPY_DIR, True)
 
     def legacy_file(self, name):
@@ -88,10 +50,10 @@ class LegacyCopiesTest(unittest.TestCase):
 
 
 class RenameTest(unittest.TestCase):
-    """Old names survive only in the legacy-migration code paths."""
+    """The kali-bg-changer name is gone from the code (README.md may still mention it)."""
 
     ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ALLOWED = {"install.sh", "README.md", "tenfold_tweak/desktop.py", "tenfold_tweak/image.py"}
+    ALLOWED = {"README.md"}
 
     def test_no_leftover_old_names(self):
         hits = {}
@@ -107,10 +69,6 @@ class RenameTest(unittest.TestCase):
                 if lines:
                     hits[rel] = lines
         self.assertLessEqual(set(hits), self.ALLOWED, hits)
-        for rel in ("tenfold_tweak/desktop.py", "tenfold_tweak/image.py"):
-            for line in hits.get(rel, []):
-                self.assertRegex(line, r"^LEGACY_\w+ = ")
-        self.assertEqual(len(hits.get("README.md", [])), 1)  # the migration paragraph
 
 
 class StatusTest(unittest.TestCase):
@@ -171,3 +129,21 @@ class StatusTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MigrateOnceTest(unittest.TestCase):
+    def setUp(self):
+        self.assertTrue(image.LEGACY_COPY_DIR.startswith(SANDBOX))
+        self.addCleanup(shutil.rmtree, image.LEGACY_COPY_DIR, True)
+        self.addCleanup(shutil.rmtree, image.COPY_DIR, True)
+        self.addCleanup(setattr, migrate, "_done", False)
+        migrate._done = False
+
+    def test_second_call_after_failure_is_noop(self):
+        write(os.path.join(image.LEGACY_COPY_DIR, image.COPY_PREFIX + "aaa.png"), b"x")
+        with mock.patch.object(desktop, "relocate", side_effect=desktop.DesktopError("boom")) as rel:
+            first = migrate.migrate_user("gnome")
+            second = migrate.migrate_user("gnome")
+        self.assertEqual(rel.call_count, 1)
+        self.assertTrue(any("cannot move images" in w for w in first))
+        self.assertEqual(second, [])

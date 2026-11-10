@@ -1,0 +1,18 @@
+#!/bin/sh
+# tenfold-tweaks preinst: migrate an install.sh (tenfold-tweak) install; failure aborts the install.
+set -e
+
+#COMMON#
+
+case "$1" in
+    install | upgrade)
+        tt_migrate_legacy
+        ;;
+    abort-upgrade) ;;
+    *)
+        echo "preinst called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

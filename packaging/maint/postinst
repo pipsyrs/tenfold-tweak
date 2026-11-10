@@ -1,0 +1,20 @@
+#!/bin/sh
+# tenfold-tweaks postinst: remove install.sh leftovers and re-embed an old-named login theme entry.
+set -e
+
+#COMMON#
+
+case "$1" in
+    configure)
+        rm -f -- "$TT_R$TT_STATE/$TT_MARKER"
+        (tt_cleanup_legacy) || tt_warn "some tenfold-tweak leftovers were not removed"
+        "$TT_R$TT_HELPER" pkg-configure || tt_warn "login theme not updated; restore and apply the login image again"
+        ;;
+    abort-upgrade | abort-remove | abort-deconfigure) ;;
+    *)
+        echo "postinst called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

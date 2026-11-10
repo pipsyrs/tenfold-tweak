@@ -1,2 +1,12 @@
 # tenfold
 /.claude/tenfold/
+
+/.claude/tenfold.json
+
+# python
+__pycache__/
+*.py[cod]
+
+# packaging
+/build/
+/dist/

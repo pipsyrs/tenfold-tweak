@@ -6,7 +6,7 @@ import time
 import unittest
 from unittest import mock
 
-from tenfold_tweak import core, gui
+from tenfold_tweak import core, gui, system
 from tenfold_tweak.core import Result, TargetStatus
 
 
@@ -45,6 +45,23 @@ class StatusTextTest(unittest.TestCase):
         self.assertEqual(gui.env_subtitle("gnome", "gdm3"), "GNOME · GDM")
         self.assertEqual(gui.env_subtitle("other", "sddm"), "other · sddm")
 
+
+
+class SystemTextTest(unittest.TestCase):
+    def test_summary_points_to_apt_not_in_app_install(self):
+        self.assertEqual(gui.system_summary(core.SetupState(True))[:2], ("Installed", "accent"))
+        pill, _, text = gui.system_summary(core.SetupState(False, "helper missing"))
+        self.assertEqual(pill, "Not installed")
+        self.assertIn("tenfold-tweaks package", text)
+        self.assertFalse(hasattr(gui, "INSTALL_HINT"))  # single source: system.INSTALL_HINT
+
+    def test_skip_text_names_targets_and_hint(self):
+        text = gui.setup_skip_text(["login"])
+        self.assertTrue(text.startswith("Login screen: skipped"))
+        self.assertIn(system.INSTALL_HINT, text)
+
+    def test_app_id(self):
+        self.assertEqual(gui.APP_ID, "io.github.tenfold.tenfold-tweaks")
 
 class ResultTextTest(unittest.TestCase):
     def test_card_result(self):
@@ -146,10 +163,11 @@ class DetachForkTest(unittest.TestCase):
         self.addCleanup(env.stop)
         gui.os.environ.pop(gui._READY_ENV, None)  # we are the launching (parent) process
 
-    def _parent(self, read=b"\x01", code=0):
+    def _parent(self, read=b"\x01", code=0, wait=None):
         calls = []
         child = mock.Mock()
         child.wait.return_value = code
+        child.wait.side_effect = wait
         with mock.patch.object(gui, "_detach_requested", return_value=True), \
                 mock.patch.object(gui.os, "pipe", return_value=(10, 11)), \
                 mock.patch.object(gui.subprocess, "Popen", return_value=child) as po, \
@@ -203,6 +221,105 @@ class DetachForkTest(unittest.TestCase):
         child.terminate.assert_called_once()
         child.wait.assert_called_once()
         ex.assert_called_once_with(130)
+
+    def _fake_signal(self):
+        handlers = {}
+
+        def fake(s, h):
+            old, handlers[s] = handlers.get(s, gui.signal.SIG_DFL), h
+            return old
+        patches = (mock.patch.object(gui.signal, "signal", side_effect=fake),
+                   mock.patch.object(gui.signal, "getsignal", return_value=gui.signal.SIG_DFL))
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        return handlers
+
+    def _signalled(self, signum, wait=None):
+        handlers = self._fake_signal()
+        _, child, ex, _ = self._parent(read=lambda: handlers[signum](signum, None), wait=wait)
+        return child, ex, handlers
+
+    def test_sighup_before_map_terminates_child_and_exits_129(self):
+        child, ex, handlers = self._signalled(gui.signal.SIGHUP)
+        child.terminate.assert_called_once()
+        child.wait.assert_called_once_with(timeout=5)
+        child.kill.assert_not_called()
+        ex.assert_called_once_with(129)
+        self.assertIs(handlers[gui.signal.SIGHUP], gui._swallow)  # no re-entry during cleanup
+
+    def test_sigterm_before_map_terminates_child_and_exits_143(self):
+        child, ex, _ = self._signalled(gui.signal.SIGTERM)
+        child.terminate.assert_called_once()
+        child.wait.assert_called_once_with(timeout=5)
+        ex.assert_called_once_with(143)
+
+    def test_child_ignoring_sigterm_gets_sigkill_after_timeout(self):
+        child, ex, _ = self._signalled(
+            gui.signal.SIGHUP, wait=[gui.subprocess.TimeoutExpired("gui", 5), -9])
+        child.terminate.assert_called_once()
+        child.kill.assert_called_once()
+        self.assertEqual(child.wait.call_args_list, [mock.call(timeout=5), mock.call()])
+        ex.assert_called_once_with(129)
+
+    def test_signal_handlers_restored_once_window_mapped(self):
+        handlers = self._fake_signal()
+        _, child, ex, _ = self._parent(read=b"\x01")
+        ex.assert_called_once_with(0)
+        child.terminate.assert_not_called()
+        self.assertEqual(handlers, {gui.signal.SIGINT: gui.signal.SIG_DFL,
+                                    gui.signal.SIGHUP: gui.signal.SIG_DFL,
+                                    gui.signal.SIGTERM: gui.signal.SIG_DFL})
+
+    def _signal_lands_on(self, when, signum):
+        """Deliver signum (via its current handler) right after the signal.signal(*when) call."""
+        handlers = self._fake_signal()
+        fake, fired = gui.signal.signal.side_effect, []
+
+        def wrapped(s, h):
+            old = fake(s, h)
+            if (s, h) == when and not fired and callable(handlers[signum]):
+                fired.append(signum)  # a real signal is delivered once
+                handlers[signum](signum, None)
+            return old
+        gui.signal.signal.side_effect = wrapped
+        return handlers
+
+    def test_second_signal_during_cleanup_does_not_escape(self):
+        # systemd logout: SIGTERM right behind SIGHUP, landing while the abort ignores signals
+        handlers = self._signal_lands_on((gui.signal.SIGINT, gui._swallow), gui.signal.SIGTERM)
+        _, child, ex, _ = self._parent(read=lambda: handlers[gui.signal.SIGHUP](gui.signal.SIGHUP, None))
+        child.terminate.assert_called_once()
+        child.wait.assert_called_once_with(timeout=5)
+        ex.assert_called_once_with(129)  # first signal wins
+        for s in (gui.signal.SIGINT, gui.signal.SIGHUP, gui.signal.SIGTERM):
+            self.assertIs(handlers[s], gui._swallow)
+
+    def test_signal_after_abort_is_ignored(self):
+        handlers = self._fake_signal()
+
+        def hup_then_term():
+            try:
+                handlers[gui.signal.SIGHUP](gui.signal.SIGHUP, None)
+            finally:  # TERM still pending once HUP's handler raised
+                self.assertIs(handlers[gui.signal.SIGTERM], gui._swallow)
+        _, child, ex, _ = self._parent(read=hup_then_term)
+        child.terminate.assert_called_once()
+        ex.assert_called_once_with(129)
+
+    def test_signal_at_handler_install_still_terminates_child(self):
+        self._signal_lands_on((gui.signal.SIGHUP, gui._abort_wait), gui.signal.SIGHUP)
+        calls, child, ex, _ = self._parent()
+        self.assertNotIn(("read", 10), calls)
+        child.terminate.assert_called_once()
+        child.wait.assert_called_once_with(timeout=5)
+        ex.assert_called_once_with(129)
+
+    def test_ignored_sighup_not_hooked(self):
+        with mock.patch.object(gui.signal, "getsignal", return_value=gui.signal.SIG_IGN), \
+                mock.patch.object(gui.signal, "signal") as sig:
+            self._parent(read=b"\x01")
+        sig.assert_not_called()  # nohup launch: SIGHUP keeps being ignored
 
     def test_no_tty_no_relaunch(self):
         with mock.patch.object(gui, "_detach_requested", return_value=False), \

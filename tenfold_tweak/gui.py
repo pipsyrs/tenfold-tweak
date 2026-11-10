@@ -8,10 +8,10 @@ import subprocess
 import sys
 import threading
 
-from . import core, detect
+from . import cleaner, core, detect, system
 
-TITLE = "Tenfold Tweak"
-APP_ID = "io.github.tenfold.TenfoldTweak"
+TITLE = "Tenfold Tweaks"
+APP_ID = "io.github.tenfold.tenfold-tweaks"
 THUMB_W, THUMB_H = 640, 360  # decode size; display crops to fill
 TARGET_INFO = {
     "desktop": ("Desktop", "user-desktop-symbolic"),
@@ -78,32 +78,10 @@ def setup_targets(statuses, targets) -> list:
     return [s.target for s in statuses if s.target in targets and needs_setup(s)]
 
 
-def setup_offer_text(targets) -> tuple:
-    """(heading, body) offering setup before an apply."""
+def setup_skip_text(targets) -> str:
+    """Feedback line for targets skipped because the package is not installed."""
     names = ", ".join(target_label(t) for t in targets)
-    return ("Set up system support first?",
-            f"{names}: changing this needs a small system component, installed once with "
-            "administrator rights. Install it now and then continue?")
-
-
-def setup_feedback(action: str, res) -> tuple:
-    """(kind, text) for an install/uninstall SetupResult; a cancelled prompt is neutral."""
-    message = (getattr(res, "message", "") or "").strip()
-    if res.ok:
-        done = "installed" if action == "install" else "removed"
-        return "success", message or f"System component {done}."
-    if "cancel" in message.lower():
-        return "info", "Nothing was changed: the administrator prompt was cancelled."
-    return ("error" if action == "install" else "warning"), message or f"Could not {action} the system component."
-
-
-def discard_text(res) -> tuple:
-    """(heading, body) when setup cannot keep the old login image."""
-    message = (getattr(res, "message", "") or "").strip()
-    body = (message + "\n\n" if message else "") + (
-        "Continuing resets the login screen to its stock background. "
-        "You can apply your image again afterwards.")
-    return "Reset the login background?", body
+    return f"{names}: skipped — install the tenfold-tweaks package first ({system.INSTALL_HINT}). See System."
 
 
 def system_summary(state) -> tuple:
@@ -112,8 +90,8 @@ def system_summary(state) -> tuple:
         return ("Installed", "accent",
                 "Login screen changes and restores work from this app.")
     return ("Not installed", "dim",
-            "Needed only for the login screen. Installs a small root-owned helper with "
-            "administrator rights; desktop and lock screen work without it.")
+            "Needed only for the login screen; desktop and lock screen work without it. "
+            "It comes with the tenfold-tweaks package. Install it from a terminal:")
 
 
 def card_result(action: str, r) -> tuple:
@@ -173,6 +151,19 @@ def cover_size(width: int, height: int, box_w: int = THUMB_W, box_h: int = THUMB
     return max(1, round(width * scale)), max(1, round(height * scale))
 
 
+
+def selected_summary(ids, preview) -> tuple:
+    """(total text, subtitle) for the cleaner hero."""
+    if not ids:
+        return "Nothing selected", "Tick at least one category."
+    total, unknown = cleaner.selected_total(ids, preview)
+    n = len(ids)
+    sub = f"{n} categor{'ies' if n != 1 else 'y'} selected"
+    if cleaner.needs_admin(ids, preview):
+        sub += " · asks for your password once"
+    return ("≥ " if unknown else "") + cleaner.human(total), sub
+
+
 # ---------- toolkit ----------
 
 def _load_toolkit(use_adw: bool = True) -> str | None:
@@ -214,6 +205,7 @@ CSS = """
 .tt-result.success { color: @success_color; }
 .tt-result.warning { color: @warning_color; }
 .tt-result.error { color: @error_color; }
+.tt-command { padding: 6px 6px 6px 12px; border-radius: 8px; background-color: alpha(currentColor, 0.08); }
 .tt-feedback { padding: 10px 14px; border-radius: 10px; background-color: alpha(currentColor, 0.06); }
 .tt-feedback.success { background-color: alpha(@success_color, 0.16); }
 .tt-feedback.warning { background-color: alpha(@warning_color, 0.20); }
@@ -427,9 +419,9 @@ class TargetCard:
                                       tooltip_text="Put back the image used before this tool changed it")
         self.restore_btn.add_css_class("flat")
         self.restore_btn.connect("clicked", lambda *_: page.run("restore", None, [target]))
-        self.setup_btn = Gtk.Button(label="_Set Up", use_underline=True, visible=False,
-                                    tooltip_text="Install the system component (administrator rights)")
-        self.setup_btn.connect("clicked", lambda *_: page.shell.run_setup(page))
+        self.setup_btn = Gtk.Button(label="How to _Install", use_underline=True, visible=False,
+                                    tooltip_text="Show how to install the system component")
+        self.setup_btn.connect("clicked", lambda *_: page.shell.stack.set_visible_child_name(SystemPage.name))
         if target == "login":
             self.apply_btn.set_tooltip_text("Needs administrator rights")
         self.spinner = Gtk.Spinner(visible=False, halign=Gtk.Align.END, hexpand=True)
@@ -504,6 +496,7 @@ class BackgroundsPage:
         self.loaded = False
         self.all_image = None
         self.last_folder = None
+        self._skipped = []
 
         self.widget = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
         self.widget.add_named(self._build_loading(), "loading")
@@ -719,19 +712,12 @@ class BackgroundsPage:
     def run(self, action: str, image: str | None, targets: list, from_hero=False):
         if self.shell.busy or not targets or (action == "apply" and not image):
             return
-        pending_setup = setup_targets(self.statuses, targets) if action == "apply" else []
-        if pending_setup:
-            def answered(ok):
-                if ok:  # install, re-read status, then run the apply again
-                    self.shell.run_setup(self, then=lambda: self.run(action, image, targets, from_hero))
-                else:
-                    rest = [t for t in targets if t not in pending_setup]
-                    if rest:
-                        self.run(action, image, rest, from_hero)
-                    else:
-                        self.feedback("info", "Nothing was changed.")
-            heading, body = setup_offer_text(pending_setup)
-            self.shell.ask(heading, body, "Set _Up & Continue", False, answered)
+        self._skipped = setup_targets(self.statuses, targets) if action == "apply" else []
+        for t in self._skipped:  # needs the package; there is no in-app install
+            self.cards[t].set_result("Skipped — install the tenfold-tweaks package first", "warning")
+        targets = [t for t in targets if t not in self._skipped]
+        if not targets:
+            self.feedback("warning", setup_skip_text(self._skipped))
             return
         self.shell.set_busy(True)
         for t in targets:
@@ -767,9 +753,12 @@ class BackgroundsPage:
             self.cards[r.target].set_result(*card_result(action, r))
             if action == "apply" and r.status == core.APPLIED:
                 self.cards[r.target].pending = None
-        if from_hero and all(r.status == core.APPLIED for r in results if r.target in targets):
+        skipped = self._skipped
+        if from_hero and not skipped and all(r.status == core.APPLIED for r in results if r.target in targets):
             self.all_image = None
-        self.feedback(*summarize(action, results, core.notes(results)))
+        notes = list(core.notes(results)) + ([setup_skip_text(skipped)] if skipped else [])
+        kind, text = summarize(action, results, notes)
+        self.feedback("warning" if skipped and kind == "success" else kind, text)
         self.sync()
         self.refresh()
         return False
@@ -802,19 +791,31 @@ class SystemPage:
         self.desc = _label("Checking…", "dim-label", wrap=True)
         self.reason = _label("", "caption", "tt-result", "warning", wrap=True, selectable=True, visible=False)
         card.append(self.desc)
-        card.append(self.reason)
 
-        row = Gtk.Box(spacing=8, margin_top=4)
-        self.install_btn = Gtk.Button(label="_Install", use_underline=True,
-                                      tooltip_text="Install with administrator rights")
-        self.install_btn.connect("clicked", lambda *_: shell.run_setup(self))
-        self.remove_btn = Gtk.Button(label="_Remove", use_underline=True)
-        self.remove_btn.add_css_class("destructive-action")
-        self.remove_btn.connect("clicked", lambda *_: self._confirm_remove())
-        row.append(self.install_btn)
-        row.append(self.remove_btn)
-        card.append(row)
+        # Install hint: text to copy, nothing here runs as root
+        self.hint = Gtk.Box(spacing=8, margin_top=4, visible=False)
+        self.hint.add_css_class("tt-command")
+        self.hint.append(_label(system.INSTALL_HINT, "monospace", hexpand=True, selectable=True, wrap=True,
+                                valign=Gtk.Align.CENTER))
+        copy = Gtk.Button(icon_name="edit-copy-symbolic", tooltip_text="Copy command", valign=Gtk.Align.CENTER)
+        copy.add_css_class("flat")
+        copy.update_property([Gtk.AccessibleProperty.LABEL], ["Copy install command"])
+        copy.connect("clicked", self._copy_hint)
+        self.hint.append(copy)
+        card.append(self.hint)
+        card.append(self.reason)
         col.append(card)
+
+        # Login images saved by an earlier package removal
+        self.saved = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, visible=False)
+        self.saved.add_css_class("card")
+        self.saved.add_css_class("tt-card")
+        self.saved.append(_label("Saved login images", "heading"))
+        self.saved.append(_label("Kept when the package was removed. Copy any you want to keep; "
+                                 "they stay until you delete them.", "dim-label", wrap=True))
+        self.saved_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.saved.append(self.saved_list)
+        col.append(self.saved)
 
         content = Adw.Clamp(maximum_size=760, child=col) if Adw else col
         self.widget = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True, child=content)
@@ -822,28 +823,26 @@ class SystemPage:
     def feedback(self, kind: str, text: str, working=False):
         self.bar.show(kind, text, working)
 
+    def _copy_hint(self, button):
+        button.get_clipboard().set_content(Gdk.ContentProvider.new_for_value(system.INSTALL_HINT))
+        self.feedback("info", "Command copied. Run it in a terminal from the folder with the .deb file.")
+
     def sync(self):
-        st, busy = self.state, self.shell.busy
-        self.install_btn.set_sensitive(bool(st and st.can_install) and not busy)
-        self.remove_btn.set_sensitive(bool(st and st.can_uninstall) and not busy)
-        if st and st.can_install and not st.installed:
-            self.install_btn.add_css_class("suggested-action")
-        else:
-            self.install_btn.remove_css_class("suggested-action")
+        pass  # read-only page: nothing depends on busy
 
     def refresh(self, after=None):
         self.spinner.set_visible(True)
 
         def work():
             try:
-                out = (core.setup_state(), None)
+                out = (core.setup_state(), system.saved_login_images(), None)
             except Exception as e:
-                out = (None, str(e) or type(e).__name__)
+                out = (None, [], str(e) or type(e).__name__)
             GLib.idle_add(self._on_state, *out, after)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_state(self, state, error, after):
+    def _on_state(self, state, saved, error, after):
         self.spinner.set_visible(False)
         if error:
             self.desc.set_label("Could not read the system component state.")
@@ -857,40 +856,264 @@ class SystemPage:
             if cls == "accent":
                 self.badge.add_css_class("accent")
             self.desc.set_label(text)
+            self.hint.set_visible(not state.installed)
             self.reason.set_label(state.reason or "")
-            self.reason.set_visible(bool(state.reason))
+            self.reason.set_visible(bool(state.reason) and not state.installed)
+        while child := self.saved_list.get_first_child():
+            self.saved_list.remove(child)
+        for path in saved:
+            self.saved_list.append(_label(path, "monospace", "caption", selectable=True, wrap=True))
+        self.saved.set_visible(bool(saved))
         self.sync()
         if after and not error:
             after()
         return False
 
-    def _confirm_remove(self):
-        body = ("The login screen can no longer be changed or restored from this app until it is "
-                "installed again. Restore the login background first if you changed it.")
-        self.shell.ask("Remove the system component?", body, "_Remove", True,
-                       lambda ok: ok and self._remove())
 
-    def _remove(self):
-        self.shell.set_busy(True)
-        self.feedback("info", "Removing the system component… Approve the administrator prompt.", working=True)
+class CleanerRow:
+    """One cleaner category: checkbox, admin badge, size/count, notes, optional package list."""
+
+    def __init__(self, page, cat):
+        self.cat = cat
+        self.widget = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin_top=10, margin_bottom=10,
+                              margin_start=12, margin_end=12)
+        top = Gtk.Box(spacing=10)
+        self.check = Gtk.CheckButton(label=cat.label, hexpand=True)
+        self.check.connect("toggled", lambda *_: page.sync())
+        top.append(self.check)
+        self.badge = _label("admin", "tt-badge", valign=Gtk.Align.CENTER, visible=cat.level != "user",
+                            tooltip_text="Asks for your password")
+        top.append(self.badge)
+        self.size = _label("…", "numeric", "dim-label", xalign=1, valign=Gtk.Align.CENTER)
+        top.append(self.size)
+        self.widget.append(top)
+        self.note = _label("", "caption", "dim-label", wrap=True, margin_start=28, visible=False)
+        self.widget.append(self.note)
+        self.packages = _label("", "monospace", "caption", wrap=True, selectable=True)
+        self.expander = Gtk.Expander(child=self.packages, margin_start=28, visible=False)
+        self.widget.append(self.expander)
+
+    def update(self, est):
+        size, note = cleaner.estimate_text(est), est.note or ""
+        self.size.set_label(size)
+        self.badge.set_visible(est.admin)
+        self.note.set_label(note)
+        self.note.set_visible(bool(note))
+        self.check.update_property([Gtk.AccessibleProperty.DESCRIPTION],
+                                   [", ".join(filter(None, [size, "needs admin" if est.admin else "", note]))])
+        n = len(est.packages)
+        self.expander.set_label(f"Show {n} package{'s' if n != 1 else ''}")
+        self.packages.set_label("\n".join(est.packages))
+        self.expander.set_visible(bool(n))
+
+
+class CleanerPage:
+    """Section: frees disk space from caches, old logs, trash and orphan packages."""
+
+    name, title, icon = "cleaner", "Clean up", "user-trash-symbolic"
+
+    def __init__(self, shell):
+        self.shell = shell
+        self.preview = None
+        self.scanning = False
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18, margin_top=18, margin_bottom=24,
+                      margin_start=16, margin_end=16)
+        self.bar = FeedbackBar()
+        col.append(self.bar.widget)
+
+        # Focal point: what the current selection frees, and the one action
+        hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        hero.add_css_class("card")
+        hero.add_css_class("tt-hero")
+        head = Gtk.Box(spacing=10)
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+        info.append(_label("Selected to clean", "caption", "dim-label"))
+        self.total = _label("Scanning…", "title-1", "numeric", wrap=True)
+        info.append(self.total)
+        self.total_sub = _label("", "caption", "dim-label", wrap=True)
+        info.append(self.total_sub)
+        head.append(info)
+        self.spinner = Gtk.Spinner(valign=Gtk.Align.START, visible=False)
+        head.append(self.spinner)
+        self.rescan = Gtk.Button(label="_Rescan", use_underline=True, valign=Gtk.Align.START,
+                                 tooltip_text="Measure again")
+        self.rescan.add_css_class("flat")
+        self.rescan.connect("clicked", lambda *_: self.scan())
+        head.append(self.rescan)
+        hero.append(head)
+        note = Gtk.Box(spacing=8)
+        note.append(Gtk.Image(icon_name="dialog-information-symbolic", valign=Gtk.Align.START))
+        note.append(_label(cleaner.DISK_NOTE, "dim-label", wrap=True, hexpand=True))
+        hero.append(note)
+        self.clean_btn = Gtk.Button(label="_Clean…", use_underline=True, halign=Gtk.Align.END)
+        self.clean_btn.add_css_class("suggested-action")
+        self.clean_btn.add_css_class("pill")
+        self.clean_btn.connect("clicked", lambda *_: self.confirm())
+        hero.append(self.clean_btn)
+        col.append(hero)
+
+        cats = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        cats.add_css_class("card")
+        cats.add_css_class("tt-card")
+        self.rows = {}
+        for i, cat in enumerate(cleaner.CATEGORIES):
+            if i:
+                cats.append(Gtk.Separator())
+            self.rows[cat.id] = CleanerRow(self, cat)
+            cats.append(self.rows[cat.id].widget)
+        col.append(cats)
+
+        # Result of the last clean; stays until the page is opened again
+        self.result = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, visible=False)
+        self.result.add_css_class("card")
+        self.result.add_css_class("tt-card")
+        self.result.append(_label("Last clean", "heading"))
+        self.result_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.result.append(self.result_list)
+        self.result_total = _label("", "heading", margin_top=6)
+        self.result.append(self.result_total)
+        col.append(self.result)
+
+        content = Adw.Clamp(maximum_size=760, child=col) if Adw else col
+        self.widget = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True, child=content)
+        self.reset()
+
+    def selected(self) -> list:
+        return [cid for cid, row in self.rows.items() if row.check.get_active()]
+
+    def reset(self):
+        """Opt-in categories start unticked every time; the choice is never saved."""
+        for row in self.rows.values():
+            row.check.set_active(row.cat.default)
+
+    def feedback(self, kind: str, text: str, working=False):
+        self.bar.show(kind, text, working)
+
+    def sync(self):
+        idle = not self.shell.busy and not self.scanning
+        ids = self.selected()
+        for row in self.rows.values():
+            row.check.set_sensitive(idle and self.preview is not None)
+        self.rescan.set_sensitive(idle)
+        self.clean_btn.set_sensitive(idle and self.preview is not None and bool(ids))
+        if self.preview is not None:
+            total, sub = selected_summary(ids, self.preview)
+            self.total.set_label(total)
+            self.total_sub.set_label(sub)
+
+    def opened(self):
+        if self.shell.busy:
+            return  # a clean is running; keep its selection
+        self.reset()
+        self.result.set_visible(False)
+        self.scan()
+
+    def refresh(self, after=None):
+        # Scans only when shown: preview walks caches and asks apt
+        if self.widget.get_mapped():
+            self.scan()
+        if after:
+            after()
+
+    def scan(self):
+        if self.scanning or self.shell.busy:
+            return
+        self.scanning = True
+        self.spinner.set_visible(True)
+        self.spinner.set_spinning(True)
+        if self.preview is None:
+            self.total.set_label("Scanning…")
+        self.sync()
 
         def work():
             try:
-                res, error = core.uninstall_system(), None
+                out = (cleaner.preview(), None)
             except Exception as e:
-                res, error = None, f"Unexpected error: {e or type(e).__name__}"
-            GLib.idle_add(self._remove_done, res, error)
+                out = (None, str(e) or type(e).__name__)
+            GLib.idle_add(self._on_preview, *out)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _remove_done(self, res, error):
+    def _on_preview(self, preview, error):
+        self.scanning = False
+        self.spinner.set_spinning(False)
+        self.spinner.set_visible(False)
+        if error:
+            self.feedback("error", f"Could not measure disk usage: {error}")
+            if self.preview is None:
+                self.total.set_label("Scan failed")
+                self.total_sub.set_label("Use Rescan to try again.")
+        else:
+            self.preview = preview
+            for est in preview.items:
+                if est.id in self.rows:
+                    self.rows[est.id].update(est)
+            if not preview.total and not preview.total_unknown:
+                self.feedback("success", "Nothing to clean right now.")
+        self.sync()
+        return False
+
+    # ----- clean -----
+
+    def confirm(self):
+        ids, preview = self.selected(), self.preview
+        if self.shell.busy or self.scanning or not ids or preview is None:
+            return
+        body = cleaner.confirm_text(ids, preview)
+        if cleaner.needs_admin(ids, preview):
+            body += "\n\nYou will be asked for your password once."
+
+        def trash(ok):
+            if not ok:
+                return
+            if "trash" in ids:
+                self.shell.ask("Empty the Trash?", cleaner.TRASH_WARNING, "_Delete Permanently", True,
+                               lambda ok2: ok2 and self.start(ids, preview))
+            else:
+                self.start(ids, preview)
+
+        self.shell.ask("Clean Up?", body, "_Clean", False, trash)
+
+    def start(self, ids, preview):
+        if self.shell.busy:
+            return
+        self.shell.set_busy(True)
+        text = "Cleaning…" + (" Approve the administrator prompt when it appears."
+                              if cleaner.needs_admin(ids, preview) else "")
+        self.feedback("info", text, working=True)
+
+        def work():
+            try:
+                out = (cleaner.clean(ids, preview), None)
+            except Exception as e:
+                out = (None, f"Unexpected error: {e or type(e).__name__}")
+            GLib.idle_add(self._clean_done, *out)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _clean_done(self, report, error):
         self.shell.set_busy(False)
-        self.feedback(*(("error", error) if error else setup_feedback("uninstall", res)))
-        self.shell.refresh_all()
+        if error:
+            self.feedback("error", error)
+            self.sync()
+            return False
+        while child := self.result_list.get_first_child():
+            self.result_list.remove(child)
+        kinds = {"cleaned": "success", "skipped": "warning", "failed": "error"}
+        for r in report.items:
+            self.result_list.append(_label(r.line(), "tt-result", kinds.get(r.status, ""), wrap=True,
+                                           selectable=True))
+        self.result_total.set_label(f"Total freed: {cleaner.human(report.freed)}")
+        self.result.set_visible(True)
+        statuses = {r.status for r in report.items}
+        kind = "error" if "failed" in statuses else "warning" if "skipped" in statuses else "success"
+        self.feedback(kind, f"Freed {cleaner.human(report.freed)}."
+                      + ("" if kind == "success" else " Some categories were not fully cleaned; see below."))
+        self.scan()
         return False
 
 
-SECTIONS = (BackgroundsPage, SystemPage)  # add a page class here to add a sidebar section
+SECTIONS = (BackgroundsPage, CleanerPage, SystemPage)  # add a page class here to add a sidebar section
 
 
 class Dashboard:
@@ -906,6 +1129,7 @@ class Dashboard:
         sidebar = Gtk.StackSidebar(stack=self.stack, width_request=200, vexpand=True)
         self.window = self._build_adw(sidebar) if Adw else self._build_gtk(sidebar)
         self.stack.connect("notify::visible-child-name", lambda *_: self._sync_title())
+        self.stack.connect("notify::visible-child-name", lambda *_: self._on_section())
         self._sync_title()
         self.window.connect("close-request", self._on_close)
         for page in self.pages:
@@ -958,6 +1182,10 @@ class Dashboard:
         else:
             self.title.set_label(text)
 
+    def _on_section(self):
+        page = next((p for p in self.pages if p.name == self.stack.get_visible_child_name()), None)
+        getattr(page, "opened", lambda: None)()
+
     def _on_close(self, *_):
         if not self.busy:
             return False
@@ -974,46 +1202,6 @@ class Dashboard:
         """Re-read every section; after() runs when `page` has reloaded."""
         for p in self.pages:
             p.refresh(after if p is page else None)
-
-    def run_setup(self, page, then=None):
-        """Install the system component off the UI thread; feedback goes to `page`."""
-        if self.busy:
-            return
-        self.set_busy(True)
-
-        def start(discard: bool):
-            page.feedback("info", "Installing the system component… Approve the administrator prompt.",
-                          working=True)
-
-            def work():
-                try:
-                    res, error = core.install_system(discard_login=discard), None
-                except Exception as e:
-                    res, error = None, f"Unexpected error: {e or type(e).__name__}"
-                GLib.idle_add(done, res, error, discard)
-
-            threading.Thread(target=work, daemon=True).start()
-
-        def done(res, error, discard):
-            if error:
-                self.set_busy(False)
-                page.feedback("error", error)
-                return False
-            if not res.ok and getattr(res, "needs_discard_login", False) and not discard:
-                heading, body = discard_text(res)
-                self.ask(heading, body, "Reset Login Background & _Continue", True,
-                         lambda ok: start(True) if ok else cancelled())
-                return False
-            self.set_busy(False)
-            page.feedback(*setup_feedback("install", res))
-            self.refresh_all(page, then if res.ok else None)
-            return False
-
-        def cancelled():
-            self.set_busy(False)
-            page.feedback("info", "Setup cancelled. Nothing was changed.")
-
-        start(False)
 
     def confirm_blocking(self, message: str):
         """core.run confirm callback; called from a worker thread, asks on the UI thread."""
@@ -1076,8 +1264,8 @@ def build_app(use_adw: bool = True):
     if error:
         return None, error
     if not Gtk.init_check() or Gdk.Display.get_default() is None:
-        return None, "no graphical display found; use the command line (tenfold-tweak --help)"
-    GLib.set_prgname("tenfold-tweak")
+        return None, "no graphical display found; use the command line (tenfold-tweaks --help)"
+    GLib.set_prgname("tenfold-tweaks")
     GLib.set_application_name(TITLE)
     app_cls = Adw.Application if Adw else Gtk.Application
     app = app_cls(application_id=APP_ID, flags=Gio.ApplicationFlags.NON_UNIQUE)
@@ -1110,7 +1298,7 @@ def notice_command(message: str, which=shutil.which) -> list | None:
 
 
 def _report_error(message: str):
-    print(f"tenfold-tweak: {message}", file=sys.stderr)
+    print(f"tenfold-tweaks: {message}", file=sys.stderr)
     if sys.stderr.isatty():
         return
     cmd = notice_command(message)  # started from the menu: nobody sees stderr
@@ -1135,6 +1323,23 @@ def _detach_requested() -> bool:
 _READY_ENV = "TENFOLD_TWEAK_READY_FD"  # fd the relaunched child signals on at first map
 
 
+class _WaitAborted(BaseException):
+    """SIGHUP/SIGTERM reached the parent while it waited for the child to map."""
+
+
+def _swallow(_signum, _frame):
+    """No-op for late signals: SIG_IGN would warn about ones already pending (3.14)."""
+
+
+def _abort_wait(signum, _frame):
+    try:
+        for s in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):  # one-shot: later signals can't re-raise
+            signal.signal(s, _swallow)
+    except _WaitAborted:
+        pass  # a second signal nested in here mid-loop: the first one still wins
+    raise _WaitAborted(signum)
+
+
 def _wait_for_child():
     """Relaunch self detached, hold the terminal until its window maps, then exit."""
     try:
@@ -1153,20 +1358,30 @@ def _wait_for_child():
         os.close(w)
         return  # spawn failed: stay attached
     os.close(w)
-    try:
+    try:  # handlers installed inside: an early signal still reaches the cleanup below
+        old = {s: signal.signal(s, _abort_wait) for s in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM)
+               if signal.getsignal(s) is not signal.SIG_IGN}  # e.g. nohup: keep ignoring
         try:
             ready = os.read(r, 1)
         except OSError:
             ready = b""
+        for s, handler in old.items():  # wait over: child must outlive us from here
+            signal.signal(s, handler)
         os.close(r)
         if ready:
             os._exit(0)  # window shown; free the prompt, GUI keeps running detached
         code = child.wait()  # child died first: mirror it
-    except KeyboardInterrupt:  # Ctrl+C before map: abort the startup too
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except (KeyboardInterrupt, _WaitAborted) as e:  # INT/HUP/TERM before map: abort startup too
+        signum = e.args[0] if isinstance(e, _WaitAborted) else signal.SIGINT
+        for s in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
+            signal.signal(s, _swallow)
         child.terminate()
-        child.wait()
-        os._exit(130)
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:  # child ignores SIGTERM
+            child.kill()
+            child.wait()
+        os._exit(128 + signum)
     os._exit(128 - code if code < 0 else code)
 
 

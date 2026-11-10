@@ -16,9 +16,9 @@ PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 JPEG_MAGIC = b"\xff\xd8\xff"
 COPY_DIR = os.path.join(
     os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"),
-    "backgrounds", "tenfold-tweak")
-# Copies made under the tool's old name; still cleaned up once nothing references them.
-LEGACY_COPY_DIR = os.path.join(os.path.dirname(COPY_DIR), "kali-bg-changer")
+    "backgrounds", "tenfold-tweaks")
+# Copies made under the tool's old name; moved by migrate.migrate_user(), else cleaned up once unreferenced.
+LEGACY_COPY_DIR = os.path.join(os.path.dirname(COPY_DIR), "tenfold-tweak")
 COPY_PREFIX = "wallpaper-"
 LOGIN_PREFIX = "login-"
 # Login images are decoded in full by the greeter; keep in sync with root_helper.MAX_LOGIN_DIM.
@@ -137,22 +137,74 @@ def login_copy(path: str) -> str:
     return final
 
 
-def cleanup_copies(keep: set):
-    """Delete tool-owned copies not in keep (paths still referenced by settings)."""
-    keep = {os.path.realpath(p) for p in keep if p}
-    for directory in (COPY_DIR, LEGACY_COPY_DIR):
-        try:
-            names = os.listdir(directory)
-        except OSError:
-            continue
-        for name in names:
-            path = os.path.join(directory, name)
-            if name.startswith((COPY_PREFIX, LOGIN_PREFIX, ".incoming-")) and os.path.realpath(path) not in keep:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+def _scope(directory: str) -> tuple:
+    """(data dir, ("backgrounds", name)) of a copy dir, for cleaner._open_scope."""
+    parent = os.path.dirname(directory)
+    return os.path.dirname(parent), (os.path.basename(parent), os.path.basename(directory))
+
+
+def tool_copies():
+    """Yield (dir_fd, name, path, lstat) of prefixed regular files owned by the user in the copy dirs.
+
+    Every dir is opened via dir_fd without following symlinks and must be the user's (cleaner._open_scope);
+    all are validated before the first yield, else cleaner._NotDir is raised."""
+    from . import cleaner
+    opened = []
     try:
-        os.rmdir(LEGACY_COPY_DIR)  # only succeeds once empty
+        for directory in (COPY_DIR, LEGACY_COPY_DIR):
+            fd = cleaner._open_scope(*_scope(directory))
+            if fd is not None:
+                opened.append((directory, fd))
+        for directory, fd in opened:
+            for name in os.listdir(fd):
+                if not name.startswith((COPY_PREFIX, LOGIN_PREFIX, ".incoming-")):
+                    continue
+                try:
+                    st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid():
+                    yield fd, name, os.path.join(directory, name), st
+    finally:
+        for _directory, fd in opened:
+            os.close(fd)
+
+
+def remove_legacy_dir():
+    """rmdir the legacy copy dir via its parent's dir_fd; only succeeds once empty."""
+    from . import cleaner
+    base, parts = _scope(LEGACY_COPY_DIR)
+    try:
+        fd = cleaner._open_scope(base, parts[:1])
+    except cleaner._NotDir:
+        return
+    if fd is None:
+        return
+    try:
+        os.rmdir(parts[1], dir_fd=fd)
     except OSError:
         pass
+    finally:
+        os.close(fd)
+
+
+def unreferenced_copies(keep: set) -> list:
+    """Tool-owned copies not in keep (paths still referenced by settings); read-only."""
+    keep = {os.path.realpath(p) for p in keep if p}
+    return [path for _fd, _name, path, _st in tool_copies() if os.path.realpath(path) not in keep]
+
+
+def cleanup_copies(keep: set):
+    """Delete tool-owned copies not in keep (paths still referenced by settings)."""
+    from . import cleaner
+    keep = {os.path.realpath(p) for p in keep if p}
+    try:
+        for fd, name, path, _st in tool_copies():
+            if os.path.realpath(path) not in keep:
+                try:
+                    os.unlink(name, dir_fd=fd)
+                except OSError:
+                    pass
+    except cleaner._NotDir:
+        return  # a copy dir is a symlink or not the user's: touch nothing
+    remove_legacy_dir()

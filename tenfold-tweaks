@@ -4,6 +4,7 @@
 import os
 import sys
 
+sys.dont_write_bytecode = True  # no root-owned .pyc next to an installed copy
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 from tenfold_tweak import cli  # noqa: E402

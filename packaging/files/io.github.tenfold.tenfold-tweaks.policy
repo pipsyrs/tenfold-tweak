@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Tenfold Tweaks</vendor>
+  <action id="io.github.tenfold.tenfold-tweaks.gdm-apply">
+    <description>Change the login screen background</description>
+    <message>Authentication is required to change or restore the login screen background</message>
+    <icon_name>preferences-desktop-wallpaper</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/tenfold-tweaks/root-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">gdm-apply</annotate>
+  </action>
+  <action id="io.github.tenfold.tenfold-tweaks.gdm-restore">
+    <description>Change the login screen background</description>
+    <message>Authentication is required to change or restore the login screen background</message>
+    <icon_name>preferences-desktop-wallpaper</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/tenfold-tweaks/root-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">gdm-restore</annotate>
+  </action>
+  <action id="io.github.tenfold.tenfold-tweaks.lightdm-apply">
+    <description>Change the login screen background</description>
+    <message>Authentication is required to change or restore the login screen background</message>
+    <icon_name>preferences-desktop-wallpaper</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/tenfold-tweaks/root-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">lightdm-apply</annotate>
+  </action>
+  <action id="io.github.tenfold.tenfold-tweaks.lightdm-restore">
+    <description>Change the login screen background</description>
+    <message>Authentication is required to change or restore the login screen background</message>
+    <icon_name>preferences-desktop-wallpaper</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/tenfold-tweaks/root-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">lightdm-restore</annotate>
+  </action>
+  <action id="io.github.tenfold.tenfold-tweaks.clean">
+    <description>Remove system junk files</description>
+    <message>Authentication is required to remove system junk files</message>
+    <icon_name>user-trash-full</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/tenfold-tweaks/root-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">clean</annotate>
+  </action>
+  <!-- Fallback when argv1 matches no action above -->
+  <action id="io.github.tenfold.tenfold-tweaks.root-helper">
+    <description>Run Tenfold Tweaks system actions</description>
+    <message>Authentication is required to run Tenfold Tweaks system actions</message>
+    <icon_name>preferences-system</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/tenfold-tweaks/root-helper</annotate>
+  </action>
+</policyconfig>

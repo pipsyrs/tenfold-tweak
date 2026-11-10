@@ -2,8 +2,6 @@
 
 import io
 import os
-import shutil
-import subprocess
 import unittest
 from contextlib import redirect_stderr
 from unittest import mock
@@ -23,14 +21,14 @@ class HelperOwnershipTest(unittest.TestCase):
         self.assertIsNone(system.helper_problem("/etc/hostname"))
 
     def test_default_path_is_fixed_install_location(self):
-        self.assertEqual(system.HELPER, "/usr/local/lib/tenfold-tweak/tenfold_tweak/root_helper.py")
+        self.assertEqual(system.HELPER, "/usr/libexec/tenfold-tweaks/root-helper")
         self.assertEqual(rh.INSTALLED_HELPER, system.HELPER)
         self.assertEqual(rh._dump_command("/x")[:3], ["/usr/bin/python3", "-I", system.HELPER])
 
     def test_missing_helper(self):
         problem = system.helper_problem(os.path.join(self.d, "nope.py"))
         self.assertIn("not installed", problem)
-        self.assertIn("sudo ./install.sh", problem)
+        self.assertIn("sudo apt install", problem)
 
     def test_user_owned_helper_refused(self):
         path = write(os.path.join(self.d, "root_helper.py"), b"")
@@ -53,13 +51,13 @@ class HelperOwnershipTest(unittest.TestCase):
                 mock.patch.object(system, "HELPER", os.path.join(self.d, "missing.py")):
             status, reason = system.run_helper("gdm-restore")
         self.assertEqual(status, "skipped")
-        self.assertIn("sudo ./install.sh", reason)
+        self.assertIn("sudo apt install", reason)
         self.assertEqual(calls, [])
 
     def test_detect_reports_install_hint_for_login(self):
         with mock.patch.object(system, "HELPER", os.path.join(self.d, "missing.py")):
             reason = detect.login_reason("gdm3")
-        self.assertIn("sudo ./install.sh", reason)
+        self.assertIn("sudo apt install", reason)
 
 
 class ActionLockTest(unittest.TestCase):
@@ -126,67 +124,6 @@ class PrivateCopiesTest(unittest.TestCase):
         self.assertEqual(os.stat(copy).st_mode & 0o777, 0o600)
         self.assertNotEqual(login, copy)
         self.assertEqual(os.stat(login).st_mode & 0o777, 0o600)
-
-
-class InstallScriptTest(unittest.TestCase):
-    def test_install_script_syntax_and_root_required(self):
-        script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "install.sh")
-        self.assertEqual(subprocess.run(["sh", "-n", script]).returncode, 0)
-        if os.geteuid() != 0:
-            proc = subprocess.run(["sh", script, "--uninstall"], capture_output=True, text=True)
-            self.assertEqual(proc.returncode, 1)
-            self.assertIn("run as root", proc.stderr)
-
-
-@unittest.skipIf(os.geteuid() == 0, "would install for real when run as root")
-class InstallSourceValidationTest(unittest.TestCase):
-    """Runs a copy of install.sh as non-root: it validates sources, then stops at the root check."""
-
-    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    FILES = ["tenfold-tweak"] + [f"tenfold_tweak/{n}.py" for n in (
-        "__init__", "cli", "core", "desktop", "detect", "gui", "image", "root_helper", "system")]
-
-    def setUp(self):
-        self.d = scratch_dir("inst-")
-        os.makedirs(os.path.join(self.d, "tenfold_tweak"))
-        shutil.copy(os.path.join(self.ROOT, "install.sh"), self.d)
-        for f in self.FILES:
-            write(os.path.join(self.d, f), b"# stub\n")
-
-    def run_install(self):
-        return subprocess.run(["sh", os.path.join(self.d, "install.sh")], capture_output=True, text=True)
-
-    def test_listed_files_match_the_package(self):
-        pkg = sorted(f"tenfold_tweak/{n}" for n in os.listdir(os.path.join(self.ROOT, "tenfold_tweak")) if n.endswith(".py"))
-        self.assertEqual(sorted(f for f in self.FILES if f.startswith("tenfold_tweak/")), pkg)
-
-    def test_regular_sources_pass_validation(self):
-        proc = self.run_install()
-        self.assertEqual(proc.returncode, 1)
-        self.assertIn("run as root", proc.stderr)
-
-    def test_symlinked_source_refused(self):
-        target = os.path.join(self.d, "tenfold_tweak", "system.py")
-        os.unlink(target)
-        os.symlink("/etc/shadow", target)
-        proc = self.run_install()
-        self.assertEqual(proc.returncode, 1)
-        self.assertIn("refusing to install", proc.stderr)
-        self.assertIn("system.py", proc.stderr)
-
-    def test_missing_source_refused(self):
-        os.unlink(os.path.join(self.d, "tenfold-tweak"))
-        self.assertIn("refusing to install", self.run_install().stderr)
-
-    def test_extra_files_are_not_installed_by_glob(self):
-        os.symlink("/etc/shadow", os.path.join(self.d, "tenfold_tweak", "evil.py"))
-        self.assertIn("run as root", self.run_install().stderr)  # not in the list, so never touched
-
-    def test_symlinked_package_dir_refused(self):
-        real = os.path.join(self.d, "real-pkg")
-        os.rename(os.path.join(self.d, "tenfold_tweak"), real)
-        os.symlink(real, os.path.join(self.d, "tenfold_tweak"))
-        self.assertIn("refusing to install", self.run_install().stderr)
 
 
 if __name__ == "__main__":

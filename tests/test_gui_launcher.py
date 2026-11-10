@@ -1,4 +1,4 @@
-"""./tenfold-tweak-gui: dependency checks and a single exec into the GUI (python3/zenity stubbed)."""
+"""./tenfold-tweaks-gui: dependency checks and a single exec into the GUI (python3/zenity stubbed)."""
 
 import os
 import shutil
@@ -8,7 +8,7 @@ import unittest
 from tests.helpers import scratch_dir
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LAUNCHER = os.path.join(ROOT, "tenfold-tweak-gui")
+LAUNCHER = os.path.join(ROOT, "tenfold-tweaks-gui")
 
 # python3 stub: fails the import check named in $STUB_MISSING, logs the final exec.
 PYTHON_STUB = """#!/bin/sh
@@ -52,7 +52,7 @@ class LauncherTest(unittest.TestCase):
     def test_all_deps_present_execs_gui_once(self):
         r = self.launch()
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(r.calls, [f"python3 {ROOT}/tenfold-tweak gui"])
+        self.assertEqual(r.calls, [f"python3 {ROOT}/tenfold-tweaks gui"])
 
     def test_no_display_fails_with_cli_hint_and_notice(self):
         r = self.launch(display=False)

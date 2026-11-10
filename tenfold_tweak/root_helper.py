@@ -1,7 +1,10 @@
+#!/usr/bin/python3 -I
 """Root-side helper for login-screen targets.
 
-Run only as: pkexec /usr/bin/python3 -I <this file> ACTION [IMAGE]
+Run only as: pkexec /usr/libexec/tenfold-tweaks/root-helper ACTION [ARG...]
 Actions: gdm-apply IMAGE | gdm-restore | lightdm-apply IMAGE | lightdm-restore
+         | clean ID... [--expect-autoremove HEX64]  (prints one JSON line)
+Maintainer scripts only (never via pkexec): pkg-configure | pkg-remove
 Exit codes: 0 ok, 3 nothing to restore, 1 failure (one-line reason on stderr).
 Standalone on purpose: stdlib + gi only, imports nothing from the package.
 """
@@ -12,12 +15,14 @@ import glob
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 EXIT_OK = 0
 EXIT_FAIL = 1
@@ -31,19 +36,26 @@ CHILD_TIMEOUT = 120
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 JPEG_MAGIC = b"\xff\xd8\xff"
 
-STATE_DIR = "/var/lib/tenfold-tweak"
+PKG = "tenfold-tweaks"
+STATE_DIR = "/var/lib/tenfold-tweaks"
 # Fixed root-owned install path; the --dump child never re-reads a user-writable copy.
-INSTALLED_HELPER = "/usr/local/lib/tenfold-tweak/tenfold_tweak/root_helper.py"
+INSTALLED_HELPER = "/usr/libexec/tenfold-tweaks/root-helper"
+# Saved login images (pkg-remove); never removed by purge.
+RESCUE_DIR = "/var/backups/tenfold-tweaks"
+# Every temp file the helper creates in a system dir starts with this.
+TMP_PREFIX = ".tenfold-tweaks-"
 
 GRESOURCE = "/usr/share/gnome-shell/gnome-shell-theme.gresource"
-GRESOURCE_NEW = "/usr/share/gnome-shell/.gnome-shell-theme.gresource.new"
+GRESOURCE_NEW = "/usr/share/gnome-shell/" + TMP_PREFIX + "gnome-shell-theme.gresource.new"
 GRESOURCE_ORIG = STATE_DIR + "/gnome-shell-theme.gresource.orig"
 GRESOURCE_META = STATE_DIR + "/gnome-shell-theme.meta"
 THEME_PREFIX = "/org/gnome/shell/theme/"
-LOGIN_ENTRY = THEME_PREFIX + "tenfold-tweak-login."
+LOGIN_ENTRY = THEME_PREFIX + "tenfold-tweaks-login."
+# Entry name used before the rename; still recognised as patched.
+LEGACY_LOGIN_ENTRY = THEME_PREFIX + "tenfold-tweak-login."
 PATCHED_CSS = ("gnome-shell-dark.css", "gnome-shell-light.css", "gnome-shell-high-contrast.css")
 CSS_BLOCK = (
-    "\n/* tenfold-tweak */\n"
+    "\n/* tenfold-tweaks */\n"
     '#lockDialogGroup {{ background: #000 url("resource://{entry}"); '
     "background-size: cover; background-repeat: no-repeat; background-position: center; }}\n"
 )
@@ -54,12 +66,53 @@ REINSTALL_HINT = "run: sudo apt install --reinstall gnome-shell-common"
 # shell the login background is changed by diverting this path instead of patching the gresource.
 SHELL_LIBS = "/usr/lib/gnome-shell/libshell-*.so"
 KALI_LOGIN_BG = "/usr/share/desktop-base/kali-theme/login/background-blurred"
-KALI_LOGIN_BG_DIVERTED = KALI_LOGIN_BG + ".tenfold-tweak"
+KALI_LOGIN_BG_DIVERTED = KALI_LOGIN_BG + ".tenfold-tweaks"
+# Divert suffix used before the rename (local diversion); migrated by the package preinst.
+LEGACY_DIVERT_SUFFIX = ".tenfold-tweak"
+LEGACY_HINT = "old tenfold-tweak diversion not migrated; reinstall the tenfold-tweaks package"
+RESTORE_SUFFIX = ".tenfold-tweaks-restore"
 DPKG_DIVERT = "/usr/bin/dpkg-divert"
+# dpkg-divert takes no dpkg lock (spike D0): runtime gdm-* actions hold these so apt cannot run meanwhile.
+DPKG_LOCKS = ("/var/lib/dpkg/lock-frontend", "/var/lib/dpkg/lock")
+DPKG_BUSY = "dpkg/apt is running; try again later"
+APT_ARCHIVES_LOCK = "/var/cache/apt/archives/lock"
 
 LIGHTDM_CONF = "/etc/lightdm/lightdm-gtk-greeter.conf"
 LIGHTDM_ORIG = STATE_DIR + "/lightdm-gtk-greeter.conf.orig"
-LIGHTDM_IMAGE_DIR = "/usr/local/share/backgrounds/tenfold-tweak"
+LIGHTDM_IMAGE_DIR = STATE_DIR + "/lightdm"
+
+# clean: the root side only ever takes these IDs, never a path.
+CLEAN_IDS = ("apt-cache", "journal", "tool-images", "autoremove")
+JOURNAL_DAYS = 7
+JOURNAL_RETENTION = f"{JOURNAL_DAYS}d"
+APT_GET = "/usr/bin/apt-get"
+JOURNALCTL = "/usr/bin/journalctl"
+DPKG_QUERY = "/usr/bin/dpkg-query"
+APT_CACHE_DIR = "/var/cache/apt"
+JOURNAL_DIR = "/var/log/journal"
+AUTOREMOVE_TIMEOUT = 900
+CLEAN_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
+# Kernel packages, incl. Kali's linux-binary-/linux-base-<version> naming; never removed.
+KERNEL_PKG = re.compile(r"^linux-(image|headers|modules|modules-extra|kbuild)-|^linux-.*[0-9]+\.[0-9]+")
+PKG_NAME = re.compile(r"^[a-z0-9][a-z0-9+.-]*(:[a-z0-9-]+)?$")
+REMV = re.compile(r"^Remv (\S+)", re.M)
+SIM_OTHER = re.compile(r"^(Inst|Conf) (\S+)", re.M)  # simulated installs/configures besides the removal
+INTERRUPTED = "apt-get timed out and was stopped; run 'sudo dpkg --configure -a' to finish interrupted package changes"
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+APT_LOCKED = ("Could not get lock", "Unable to acquire", "Unable to lock")
+PM_BUSY = "package manager busy"
+PLAN_CHANGED = "package list changed; preview again"
+CLEAN_USAGE = "usage: root-helper clean ID... [--expect-autoremove HEX64]; ID in " + ", ".join(CLEAN_IDS)
+
+PKG_ACTIONS = ("pkg-configure", "pkg-remove")
+WARN_ONLY_ACTIONS = ("pkg-configure",)
+MAINTSCRIPT_NAMES = ("preinst", "postinst", "prerm", "postrm")
+# Rebased onto DPKG_ROOT for pkg-* actions (and their --dump child).
+ROOTED_PATHS = ("INSTALLED_HELPER", "STATE_DIR", "RESCUE_DIR", "GRESOURCE", "GRESOURCE_NEW", "GRESOURCE_ORIG",
+                "GRESOURCE_META", "SHELL_LIBS", "KALI_LOGIN_BG", "KALI_LOGIN_BG_DIVERTED", "LIGHTDM_CONF",
+                "LIGHTDM_ORIG", "LIGHTDM_IMAGE_DIR")
+_dpkg_root = ""         # DPKG_ROOT of a pkg-* run; "" means /
+_dpkg_admindir = None   # DPKG_ADMINDIR of a pkg-* run
 
 
 class HelperError(Exception):
@@ -244,7 +297,7 @@ def fsync_dir(path: str):
 
 def atomic_write(dest: str, data: bytes, mode: int, tmp: str = None, before_replace=None):
     """Write data to a unique temp file next to dest, fsync, chmod, then os.replace onto dest."""
-    prefix = os.path.basename(tmp) if tmp else "." + os.path.basename(dest)
+    prefix = os.path.basename(tmp) if tmp else TMP_PREFIX + os.path.basename(dest)
     fd, tmp = tempfile.mkstemp(prefix=prefix + ".", suffix=".tmp", dir=os.path.dirname(dest))
     try:
         with os.fdopen(fd, "wb") as f:
@@ -271,7 +324,7 @@ def action_lock():
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            fail("another tenfold-tweak run is in progress")
+            fail("another tenfold-tweaks run is in progress; close tenfold-tweaks and retry")
         yield
     finally:
         os.close(fd)
@@ -358,7 +411,7 @@ def image_dims(data: bytes, ext: str) -> tuple:
 def shell_version() -> str:
     try:
         out = subprocess.run(
-            ["/usr/bin/dpkg-query", "-W", "-f=${Version}", "gnome-shell-common"],
+            ["/usr/bin/dpkg-query", *dpkg_db_args(instdir=False), "-W", "-f=${Version}", "gnome-shell-common"],
             capture_output=True, text=True, check=True, env={"PATH": "/usr/bin:/bin"})
     except (OSError, subprocess.CalledProcessError):
         fail("cannot read gnome-shell-common version")
@@ -366,7 +419,7 @@ def shell_version() -> str:
 
 
 def is_patched(entries: dict) -> bool:
-    return any(p.startswith(LOGIN_ENTRY) for p in entries)
+    return any(p.startswith((LOGIN_ENTRY, LEGACY_LOGIN_ENTRY)) for p in entries)
 
 
 def read_meta():
@@ -488,7 +541,7 @@ def gdm_gresource_restore() -> int:
 
 def kali_override_active() -> bool:
     """True when the installed gnome-shell hardcodes KALI_LOGIN_BG as the login background."""
-    needle = b'url("' + KALI_LOGIN_BG.encode() + b'")'
+    needle = b'url("' + KALI_LOGIN_BG[len(_dpkg_root):].encode() + b'")'
     for lib in sorted(glob.glob(SHELL_LIBS)):
         try:
             with open(lib, "rb") as f:
@@ -499,8 +552,17 @@ def kali_override_active() -> bool:
     return False
 
 
+def dpkg_db_args(instdir: bool = True) -> list:
+    """Explicit --instdir/--admindir of a pkg-* run; the child env never carries DPKG_* (spike D0)."""
+    args = ["--instdir", _dpkg_root] if instdir and _dpkg_root else []
+    return args + (["--admindir", _dpkg_admindir] if _dpkg_admindir else [])
+
+
 def dpkg_divert(*args) -> str:
-    cmd = [DPKG_DIVERT, *args]
+    # dpkg-divert takes paths relative to --instdir; map rooted paths back and forth.
+    root = _dpkg_root
+    args = [a[len(root):] if root and a.startswith(root + "/") else a for a in args]
+    cmd = [DPKG_DIVERT, *dpkg_db_args(), *args]
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
                              env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"})
@@ -509,7 +571,8 @@ def dpkg_divert(*args) -> str:
     if out.returncode != 0:
         msg = (out.stderr or out.stdout).strip().splitlines()
         fail(f"dpkg-divert failed: {msg[-1] if msg else out.returncode}")
-    return out.stdout.strip()
+    res = out.stdout.strip()
+    return root + res if root and res.startswith("/") else res
 
 
 def divert_marker() -> str:
@@ -517,19 +580,27 @@ def divert_marker() -> str:
     return os.path.join(STATE_DIR, "kali-login.divert")
 
 
+def legacy_diverted() -> str:
+    return KALI_LOGIN_BG + LEGACY_DIVERT_SUFFIX
+
+
 def divert_registered() -> bool:
-    return dpkg_divert("--truename", KALI_LOGIN_BG) == KALI_LOGIN_BG_DIVERTED
+    truename = dpkg_divert("--truename", KALI_LOGIN_BG)
+    # Old diversion, or the preinst migration was cut off between dropping it and adding ours.
+    if truename == legacy_diverted() or (truename == KALI_LOGIN_BG and os.path.lexists(legacy_diverted())):
+        fail(LEGACY_HINT)
+    return truename == KALI_LOGIN_BG_DIVERTED
 
 
 def divert_active() -> bool:
     """Our diversion is registered; dpkg-divert is asked only when we may have made one."""
-    if not (os.path.lexists(divert_marker()) or os.path.lexists(KALI_LOGIN_BG_DIVERTED)):
+    if not any(os.path.lexists(p) for p in (divert_marker(), KALI_LOGIN_BG_DIVERTED, legacy_diverted())):
         return False
     return divert_registered()
 
 
 def divert_args(action: str) -> list:
-    return ["--local", "--rename", "--divert", KALI_LOGIN_BG_DIVERTED, action, KALI_LOGIN_BG]
+    return ["--package", PKG, "--rename", "--divert", KALI_LOGIN_BG_DIVERTED, action, KALI_LOGIN_BG]
 
 
 def check_root_dir(path: str):
@@ -573,10 +644,16 @@ def kali_login_restore() -> bool:
             os.unlink(divert_marker())
         return False
     # Move our image aside (dpkg-divert --rename needs the path free); put it back if --remove fails.
-    aside = KALI_LOGIN_BG + ".tenfold-tweak-restore"
+    aside = KALI_LOGIN_BG + RESTORE_SUFFIX
     if os.path.lexists(aside):
-        os.unlink(aside)
-    moved = os.path.lexists(KALI_LOGIN_BG)
+        if os.path.lexists(KALI_LOGIN_BG):
+            # Stale (superseded by a later apply), or ours after a --remove that renamed stock back but failed.
+            rescue_image(read_regular(aside, MAX_IMAGE_SIZE))
+            os.unlink(aside)
+        else:
+            os.rename(aside, KALI_LOGIN_BG)  # undo an interrupted restore before retrying it
+    # No diverted file: the path is already stock (or the only copy left), so only the record is removed.
+    moved = os.path.lexists(KALI_LOGIN_BG) and os.path.lexists(KALI_LOGIN_BG_DIVERTED)
     if moved:
         os.rename(KALI_LOGIN_BG, aside)
     try:
@@ -586,7 +663,10 @@ def kali_login_restore() -> bool:
             os.rename(aside, KALI_LOGIN_BG)
         raise
     if moved:
-        os.unlink(aside)
+        if os.path.lexists(KALI_LOGIN_BG):
+            os.unlink(aside)  # stock is back at the path; our image goes as the restore asked
+        else:
+            os.rename(aside, KALI_LOGIN_BG)  # nothing was renamed back: never leave the path empty
     if os.path.lexists(divert_marker()):
         os.unlink(divert_marker())
     fsync_dir(os.path.dirname(KALI_LOGIN_BG))
@@ -717,40 +797,517 @@ def lightdm_restore() -> int:
     return EXIT_OK
 
 
+# ---------- package maintainer scripts (pkg-*) ----------
+
+def image_ext(data: bytes) -> str | None:
+    if data.startswith(PNG_MAGIC):
+        return "png"
+    if data.startswith(JPEG_MAGIC):
+        return "jpg"
+    return None
+
+
+def rescue_image(data: bytes) -> str:
+    """Keep a copy in RESCUE_DIR named by content hash; an existing name is never overwritten."""
+    os.makedirs(os.path.dirname(RESCUE_DIR), mode=0o755, exist_ok=True)
+    try:
+        os.mkdir(RESCUE_DIR, 0o755)
+    except FileExistsError:
+        pass
+    check_root_dir(RESCUE_DIR)
+    stem, ext = f"login-{hashlib.sha256(data).hexdigest()[:12]}", image_ext(data) or "img"
+    tmp, n = None, 0
+    try:
+        while n < 100:
+            final = os.path.join(RESCUE_DIR, f"{stem}-{n}.{ext}" if n else f"{stem}.{ext}")
+            if os.path.lexists(final):
+                if holds_bytes(final, data):
+                    return final
+                n += 1  # name taken by other bytes: try the next one
+                continue
+            if tmp is None:
+                fd, tmp = tempfile.mkstemp(prefix=TMP_PREFIX, suffix=".tmp", dir=RESCUE_DIR)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data)
+                    f.flush()
+                    os.fchmod(f.fileno(), 0o644)
+                    os.fsync(f.fileno())
+            try:
+                os.link(tmp, final)  # unlike rename, fails instead of replacing
+            except FileExistsError:
+                continue
+            break
+        else:
+            fail(f"cannot save login image to {RESCUE_DIR}: no free name")
+    finally:
+        if tmp is not None:
+            os.unlink(tmp)
+    fsync_dir(RESCUE_DIR)
+    return final
+
+
+def holds_bytes(path: str, data: bytes) -> bool:
+    try:
+        return read_regular(path, len(data)) == data
+    except (OSError, HelperError):
+        return False
+
+
+def saved_images() -> list:
+    try:
+        names = sorted(os.listdir(RESCUE_DIR))
+    except OSError:
+        return []
+    paths = [os.path.join(RESCUE_DIR, n) for n in names if not n.startswith(".")]
+    return [p for p in paths if stat.S_ISREG(os.lstat(p).st_mode)]
+
+
+def divert_preflight():
+    """Fail on a legacy or foreign-owned diversion of the Kali login image; no changes."""
+    if not any(os.path.lexists(p) for p in (divert_marker(), KALI_LOGIN_BG_DIVERTED, legacy_diverted())):
+        return
+    if divert_registered() and dpkg_divert("--listpackage", KALI_LOGIN_BG) != PKG:
+        fail(f"login image diversion is not owned by {PKG}")
+
+
+def gresource_backup_check():
+    meta = read_meta()
+    if not meta or meta.get("version") != shell_version() or not os.path.isfile(GRESOURCE_ORIG):
+        fail(f"no matching stock theme backup; {REINSTALL_HINT}, then remove {PKG} again")
+    raw = read_regular(GRESOURCE_ORIG, 256 * 1024 * 1024)
+    if hashlib.sha256(raw).hexdigest() != meta.get("sha256"):
+        fail(f"theme backup checksum mismatch; {REINSTALL_HINT}, then remove {PKG} again")
+
+
+def pkg_remove() -> int:
+    """prerm remove: check, save the active login images, then restore the stock login screen."""
+    divert_preflight()
+    entries = load_entries(GRESOURCE) if os.path.isfile(GRESOURCE) else {}
+    if is_patched(entries):
+        gresource_backup_check()
+    if os.path.lexists(LIGHTDM_ORIG):
+        read_regular(LIGHTDM_ORIG, 1024 * 1024)
+
+    images = []
+    if divert_active() and not os.path.islink(KALI_LOGIN_BG) and os.path.isfile(KALI_LOGIN_BG):
+        images.append(read_regular(KALI_LOGIN_BG, MAX_IMAGE_SIZE))
+    aside = KALI_LOGIN_BG + RESTORE_SUFFIX  # left by an interrupted restore --login
+    if not os.path.islink(aside) and os.path.isfile(aside):
+        images.append(read_regular(aside, MAX_IMAGE_SIZE))
+    if os.path.isdir(LIGHTDM_IMAGE_DIR) and not os.path.islink(LIGHTDM_IMAGE_DIR):
+        for name in sorted(os.listdir(LIGHTDM_IMAGE_DIR)):
+            p = os.path.join(LIGHTDM_IMAGE_DIR, name)
+            if name.startswith("login.") and stat.S_ISREG(os.lstat(p).st_mode):
+                images.append(read_regular(p, MAX_IMAGE_SIZE))
+    images += [data for p, data in sorted(entries.items()) if p.startswith((LOGIN_ENTRY, LEGACY_LOGIN_ENTRY))]
+    for data in images:
+        rescue_image(data)
+
+    kali_login_restore()
+    if os.path.isfile(GRESOURCE):
+        gdm_gresource_restore()
+    lightdm_restore()
+    for p in saved_images():
+        print(f"saved login image: {p}")
+    return EXIT_OK
+
+
+def pkg_configure() -> int:
+    """postinst configure: re-embed a login image patched under the old entry name."""
+    if not os.path.isfile(GRESOURCE):
+        return EXIT_OK
+    entries = load_entries(GRESOURCE)
+    legacy = sorted(p for p in entries if p.startswith(LEGACY_LOGIN_ENTRY))
+    if not legacy:
+        return EXIT_OK
+    data, ext = entries[legacy[0]], legacy[0][len(LEGACY_LOGIN_ENTRY):]
+    if ext not in ("png", "jpg") or image_ext(data) != ext:
+        fail(f"unexpected old theme entry {legacy[0]}")
+    gdm_gresource_apply(data, ext)
+    return EXIT_OK
+
+
+def maintscript_problem() -> str | None:
+    """pkg-* run only from this package's maintainer scripts, never through pkexec."""
+    env = os.environ
+    if ("PKEXEC_UID" in env or env.get("DPKG_MAINTSCRIPT_PACKAGE") != PKG
+            or env.get("DPKG_MAINTSCRIPT_NAME") not in MAINTSCRIPT_NAMES):
+        return f"pkg-* actions are only for the {PKG} maintainer scripts"
+    for name in ("DPKG_ROOT", "DPKG_ADMINDIR"):
+        value = env.get(name, "")
+        if value and (not os.path.isabs(value) or "\n" in value or "\x00" in value or not os.path.isdir(value)):
+            return f"{name} must be an absolute existing directory"
+    if env.get("DPKG_ROOT") and not env.get("DPKG_ADMINDIR"):
+        return "DPKG_ROOT is set without DPKG_ADMINDIR"
+    return None
+
+
+def use_dpkg_root():
+    """Take DPKG_ROOT/DPKG_ADMINDIR (validated) and rebase every system path onto the root."""
+    global _dpkg_root, _dpkg_admindir
+    root = os.path.realpath(os.environ.get("DPKG_ROOT") or "/")
+    _dpkg_root = "" if root == "/" else root
+    _dpkg_admindir = os.environ.get("DPKG_ADMINDIR") or None
+    for name in ROOTED_PATHS if _dpkg_root else ():
+        globals()[name] = _dpkg_root + globals()[name]
+
+
+@contextlib.contextmanager
+def dpkg_lock():
+    """Hold dpkg's frontend and database locks (non-blocking, like apt) for a runtime action."""
+    fds = []
+    try:
+        for path in DPKG_LOCKS:
+            fds.append(os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o640))
+            try:
+                fcntl.lockf(fds[-1], fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                fail(DPKG_BUSY)
+        yield
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+
+
+def dpkg_busy() -> bool:
+    """Probe dpkg's and apt's locks and release them at once; apt-get takes them itself."""
+    for path in DPKG_LOCKS + (APT_ARCHIVES_LOCK,):
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError:
+            continue
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        finally:
+            os.close(fd)
+    return False
+
+
+# ---------- junk cleaner (clean); the read-only parts also serve the unprivileged preview ----------
+
+class Busy(HelperError):
+    pass
+
+
+def _run_gentle(cmd: list, timeout: int, env: dict) -> subprocess.CompletedProcess:
+    """subprocess.run, but on timeout SIGTERM then wait (no SIGKILL: dpkg may be mid-transaction) and re-raise."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            stdin=subprocess.DEVNULL, env=env)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        proc.communicate()  # until apt-get and any dpkg child holding the pipes are done
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+def run_tool(cmd: list, timeout: int = CHILD_TIMEOUT, env: dict = None, gentle: bool = False) -> str:
+    """Run a fixed system command; stdout, or Busy/HelperError with its last stderr line."""
+    try:
+        if gentle:
+            proc = _run_gentle(cmd, timeout, dict(CLEAN_ENV, **(env or {})))
+        else:
+            proc = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                                  env=dict(CLEAN_ENV, **(env or {})), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        fail(INTERRUPTED if gentle else f"{os.path.basename(cmd[0])} timed out")
+    except OSError as e:
+        fail(f"cannot run {cmd[0]}: {e.strerror}")
+    if any(m in proc.stderr for m in APT_LOCKED):
+        raise Busy(PM_BUSY)
+    if proc.returncode != 0:
+        lines = [ln.strip() for ln in proc.stderr.splitlines() if ln.strip()]
+        fail(lines[-1] if lines else f"{os.path.basename(cmd[0])} exited with {proc.returncode}")
+    return proc.stdout
+
+
+def disk_usage(paths, seen: set = None) -> tuple:
+    """(bytes, files, complete) by allocated blocks; hardlinks once, symlinks never followed."""
+    seen = set() if seen is None else seen
+    size = count = 0
+    complete = True
+
+    def add(st):
+        nonlocal size, count
+        count += 1
+        if (st.st_dev, st.st_ino) not in seen:
+            seen.add((st.st_dev, st.st_ino))
+            size += st.st_blocks * 512
+
+    def walk_error(_):
+        nonlocal complete
+        complete = False
+
+    for path in paths:
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            complete = False
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            add(st)
+            continue
+        for top, dirs, files in os.walk(path, onerror=walk_error):
+            for name in files + [d for d in dirs if os.path.islink(os.path.join(top, d))]:
+                try:
+                    add(os.lstat(os.path.join(top, name)))
+                except OSError:
+                    complete = False
+    return size, count, complete
+
+
+def apt_cache_files() -> tuple:
+    """(paths, complete) of what `apt-get clean` deletes; partial/ is unreadable without root."""
+    archives = os.path.join(APT_CACHE_DIR, "archives")
+    paths = glob.glob(os.path.join(archives, "*.deb")) + glob.glob(os.path.join(APT_CACHE_DIR, "*.bin"))
+    try:
+        paths += [os.path.join(archives, "partial", n) for n in os.listdir(os.path.join(archives, "partial"))]
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return paths, False
+    return paths, True
+
+
+def journal_archives(max_age_days: int = None) -> list:
+    """Archived journal files (what --vacuum-time may delete), optionally only older than max_age_days."""
+    cutoff = None if max_age_days is None else time.time() - max_age_days * 86400
+    found = []
+    for d in sorted(os.listdir(JOURNAL_DIR)) if os.path.isdir(JOURNAL_DIR) else ():
+        sub = os.path.join(JOURNAL_DIR, d)
+        if os.path.islink(sub) or not os.path.isdir(sub):
+            continue
+        for name in os.listdir(sub):
+            if "@" in name and name.endswith((".journal", ".journal~")):
+                p = os.path.join(sub, name)
+                st = os.lstat(p)
+                if stat.S_ISREG(st.st_mode) and (cutoff is None or st.st_mtime < cutoff):
+                    found.append(p)
+    return found
+
+
+def lightdm_image() -> str | None:
+    """Image path set in the greeter conf; raises when the conf exists but cannot be read."""
+    import configparser
+    if not os.path.lexists(LIGHTDM_CONF):
+        return None
+    cp = configparser.ConfigParser(strict=False, interpolation=None)
+    with open(LIGHTDM_CONF, encoding="utf-8") as f:
+        cp.read_file(f)
+    return cp.get("greeter", "background", fallback="").strip() or None
+
+
+def tool_leftovers() -> list:
+    """System part of tool-images: fixed allowlist of leftovers; never state, backups, lock or active images.
+
+    The restore-aside login image is left out: it may be the only copy (see kali_login_restore/pkg_remove).
+    """
+    found = []
+    for d in (os.path.dirname(GRESOURCE), os.path.dirname(KALI_LOGIN_BG), os.path.dirname(LIGHTDM_CONF),
+              LIGHTDM_IMAGE_DIR):
+        found += glob.glob(os.path.join(glob.escape(d), glob.escape(TMP_PREFIX) + "*.tmp"))
+    if os.path.isdir(LIGHTDM_IMAGE_DIR) and not os.path.islink(LIGHTDM_IMAGE_DIR):
+        found += glob.glob(os.path.join(glob.escape(LIGHTDM_IMAGE_DIR), ".login-staged.*"))
+        import configparser
+        try:
+            active = lightdm_image()
+        except (OSError, UnicodeDecodeError, ValueError, configparser.Error):
+            active = ""  # unknown: keep every login.* image
+        if active != "":
+            active = os.path.realpath(active) if active else None
+            found += [p for p in glob.glob(os.path.join(glob.escape(LIGHTDM_IMAGE_DIR), "login.*"))
+                      if os.path.realpath(p) != active]
+    found = [p for p in found if os.path.lexists(p) and stat.S_ISREG(os.lstat(p).st_mode)]
+    # mkdtemp build dirs of gdm_gresource_apply
+    found += [p for p in glob.glob(os.path.join(glob.escape(STATE_DIR), "build-*"))
+              if not os.path.islink(p) and os.path.isdir(p)]
+    return sorted(found)
+
+
+def autoremove_plan() -> tuple:
+    """(packages, token) apt would autoremove, minus kernels and this package; no root needed."""
+    out = run_tool([APT_GET, "-s", "autoremove"])
+    running = os.uname().release
+    pkgs = sorted({n for n in REMV.findall(out)
+                   if not KERNEL_PKG.match(n) and running not in n and n.split(":")[0] != PKG})
+    for n in pkgs:
+        if not PKG_NAME.match(n):
+            fail(f"unexpected package name from apt-get: {n[:60]!r}")
+    return pkgs, hashlib.sha256("\n".join(pkgs).encode()).hexdigest()
+
+
+def package_sizes(pkgs: list) -> int:
+    """Installed-Size sum in bytes."""
+    if not pkgs:
+        return 0
+    out = run_tool([DPKG_QUERY, "-W", "-f=${Installed-Size}\n", "--", *pkgs])
+    return sum(int(v) for v in out.split() if v.isdigit()) * 1024
+
+
+def clean_args(argv) -> tuple:
+    """(ids, expect) from `clean` argv; anything else is a usage error."""
+    ids, expect, rest = [], None, list(argv)
+    while rest:
+        arg = rest.pop(0)
+        if arg == "--expect-autoremove" and rest and expect is None and HEX64.match(rest[0]):
+            expect = rest.pop(0)
+        elif arg in CLEAN_IDS and arg not in ids:
+            ids.append(arg)
+        else:
+            fail(CLEAN_USAGE)
+    if not ids:
+        fail(CLEAN_USAGE)
+    return ids, expect
+
+
+def clean_result(status: str = "cleaned", freed: int = 0, removed: int = 0, reason: str = "") -> dict:
+    return {"status": status, "freed": freed, "removed": removed,
+            "skipped": {"in-use": 0, "other-fs": 0}, "reason": reason}
+
+
+def file_sizes(paths) -> dict:
+    sizes = {}
+    for p in paths:
+        try:
+            sizes[p] = os.lstat(p).st_blocks * 512
+        except OSError:
+            pass
+    return sizes
+
+
+def removed_since(before: dict) -> dict:
+    gone = [p for p in before if not os.path.lexists(p)]
+    return clean_result(freed=sum(before[p] for p in gone), removed=len(gone))
+
+
+def clean_apt_cache(_expect) -> dict:
+    if dpkg_busy():
+        return clean_result("skipped", reason=PM_BUSY)
+    before = file_sizes(apt_cache_files()[0])
+    run_tool([APT_GET, "clean"])
+    return removed_since(before)
+
+
+def clean_journal(_expect) -> dict:
+    if not os.path.exists(JOURNALCTL):
+        return clean_result("skipped", reason="journalctl not available")
+    before = file_sizes(journal_archives())
+    run_tool([JOURNALCTL, f"--vacuum-time={JOURNAL_RETENTION}"])
+    return removed_since(before)
+
+
+def clean_tool_images(_expect) -> dict:
+    freed = removed = 0
+    for p in tool_leftovers():
+        size, count, _ = disk_usage([p])
+        if os.path.isdir(p) and not os.path.islink(p):
+            shutil.rmtree(p)
+        else:
+            os.unlink(p)
+        freed, removed = freed + size, removed + count
+    return clean_result(freed=freed, removed=removed)
+
+
+def clean_autoremove(expect) -> dict:
+    if dpkg_busy():
+        return clean_result("skipped", reason=PM_BUSY)
+    pkgs, token = autoremove_plan()
+    if token != expect:
+        return clean_result("skipped", reason=PLAN_CHANGED)
+    if not pkgs:
+        return clean_result()
+    sim = run_tool([APT_GET, "-s", "remove", "--", *pkgs])
+    if set(REMV.findall(sim)) != set(pkgs) or any(k == "Inst" or n not in pkgs for k, n in SIM_OTHER.findall(sim)):
+        return clean_result("skipped", reason="removal would change other packages; " + PLAN_CHANGED)
+    fs = os.statvfs("/")
+    free_before = fs.f_bfree * fs.f_frsize
+    run_tool([APT_GET, "-y", "remove", "--", *pkgs], AUTOREMOVE_TIMEOUT, {"DEBIAN_FRONTEND": "noninteractive"},
+             gentle=True)
+    fs = os.statvfs("/")
+    return clean_result(freed=max(0, fs.f_bfree * fs.f_frsize - free_before), removed=len(pkgs))
+
+
+CLEANERS = {"apt-cache": clean_apt_cache, "journal": clean_journal,
+            "tool-images": clean_tool_images, "autoremove": clean_autoremove}
+
+
+def clean(*argv) -> int:
+    """Each category independent; one JSON line on stdout, exit 0 even when some failed."""
+    ids, expect = clean_args(argv)
+    results = {}
+    for cid in ids:
+        try:
+            results[cid] = CLEANERS[cid](expect)
+        except Busy:
+            results[cid] = clean_result("skipped", reason=PM_BUSY)
+        except Exception as e:
+            msg = str(e) if isinstance(e, HelperError) else f"{type(e).__name__}: {e}"
+            results[cid] = clean_result("failed", reason=msg.replace("\n", " "))
+    print(json.dumps({"v": 1, "results": results}))
+    return EXIT_OK
+
+
 # ---------- entry point ----------
 
+# Arity None: the action validates its own argv.
 ACTIONS = {
     "gdm-apply": (1, gdm_apply),
     "gdm-restore": (0, gdm_restore),
     "lightdm-apply": (1, lightdm_apply),
     "lightdm-restore": (0, lightdm_restore),
+    "clean": (None, clean),
+    "pkg-configure": (0, pkg_configure),
+    "pkg-remove": (0, pkg_remove),
+}
+# dpkg-divert takes no dpkg lock (spike D0): gdm-* also hold dpkg's so apt cannot run meanwhile.
+# clean only probes dpkg (dpkg_busy), since apt-get must take those locks itself.
+ACTION_LOCKS = {
+    "gdm-apply": (action_lock, dpkg_lock),
+    "gdm-restore": (action_lock, dpkg_lock),
+    "clean": (action_lock,),
 }
 
 
 def main(argv) -> int:
     if argv[:1] == ["--dump"] and len(argv) == 2:
         func = dump_main  # internal: child process for Gio loads
-    elif argv[:1] and argv[0] in ACTIONS and len(argv) - 1 == ACTIONS[argv[0]][0]:
+    elif argv[:1] and argv[0] in ACTIONS and ACTIONS[argv[0]][0] in (None, len(argv) - 1):
         func = ACTIONS[argv[0]][1]
     else:
-        print("usage: root_helper.py gdm-apply IMAGE | gdm-restore | lightdm-apply IMAGE | lightdm-restore",
-              file=sys.stderr)
+        print("usage: root-helper gdm-apply IMAGE | gdm-restore | lightdm-apply IMAGE | lightdm-restore"
+              " | clean ID... [--expect-autoremove HEX64] | pkg-configure | pkg-remove", file=sys.stderr)
         return EXIT_FAIL
     if os.geteuid() != 0:
         print("must run as root", file=sys.stderr)
         return EXIT_FAIL
+    problem = maintscript_problem()
+    if argv[0] in PKG_ACTIONS and problem:
+        print(problem, file=sys.stderr)
+        return EXIT_FAIL
+    if problem is None and (argv[0] in PKG_ACTIONS or func is dump_main):
+        use_dpkg_root()  # a --dump child of a pkg-* run inherits its env
     os.umask(0o022)
     try:
         if func is dump_main:
             rc = func(*argv[1:])  # runs under the parent's lock
         else:
-            with action_lock():
+            if func is clean:
+                clean_args(argv[1:])  # usage errors before any lock or state dir
+            with contextlib.ExitStack() as stack:
+                for lock in ACTION_LOCKS.get(argv[0], (action_lock,)):
+                    stack.enter_context(lock())
                 rc = func(*argv[1:])
-    except HelperError as e:
-        print(str(e).replace("\n", " "), file=sys.stderr)
-        return EXIT_FAIL
     except Exception as e:
-        print(f"{type(e).__name__}: {e}".replace("\n", " "), file=sys.stderr)
+        msg = (str(e) if isinstance(e, HelperError) else f"{type(e).__name__}: {e}").replace("\n", " ")
+        if argv[0] in WARN_ONLY_ACTIONS:
+            print(f"warning: {msg}", file=sys.stderr)
+            return EXIT_OK
+        print(msg, file=sys.stderr)
         return EXIT_FAIL
     return EXIT_OK if rc is None else rc
 

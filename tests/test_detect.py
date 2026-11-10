@@ -32,6 +32,7 @@ class DetectTest(unittest.TestCase):
             mock.patch.object(detect, "_run", self._fake_run),
             mock.patch.object(detect.shutil, "which", lambda name: "/usr/bin/" + name),
             mock.patch.object(detect.system, "helper_problem", lambda path=None: None),
+            mock.patch.object(detect.system, "helper_outdated", lambda: False),  # independent of the installed package
         ]
         for p in patches:
             p.start()

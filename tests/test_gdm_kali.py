@@ -1,9 +1,11 @@
 """GDM login on Kali's patched gnome-shell: hardcoded inline background replaced via dpkg-divert."""
 
+import io
 import os
 import shutil
 import subprocess
 import unittest
+from contextlib import redirect_stdout
 from unittest import mock
 
 from tests.helpers import write
@@ -19,7 +21,7 @@ def needle(path: str) -> bytes:
 
 
 class FakeDivert:
-    """Stateful stand-in for dpkg-divert --local --rename (never runs the real tool)."""
+    """Stateful stand-in for dpkg-divert --package tenfold-tweaks --rename (never runs the real tool)."""
 
     def __init__(self):
         self.diverted = False
@@ -29,10 +31,10 @@ class FakeDivert:
         self.calls.append(args)
         if args[0] == "--truename":
             return rh.KALI_LOGIN_BG_DIVERTED if self.diverted else rh.KALI_LOGIN_BG
-        assert args[:4] == ("--local", "--rename", "--divert", rh.KALI_LOGIN_BG_DIVERTED), args
-        assert args[5] == rh.KALI_LOGIN_BG
+        assert args[:5] == ("--package", "tenfold-tweaks", "--rename", "--divert", rh.KALI_LOGIN_BG_DIVERTED), args
+        assert args[6] == rh.KALI_LOGIN_BG
         path, diverted = rh.KALI_LOGIN_BG, rh.KALI_LOGIN_BG_DIVERTED
-        if args[4] == "--add":
+        if args[5] == "--add":
             assert not self.diverted, "diverted twice"
             if os.path.lexists(path):
                 os.rename(path, diverted)
@@ -58,8 +60,8 @@ class ConstantsTest(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, 0, "", "")
         with mock.patch.object(rh.subprocess, "run", fake_run):
             rh.dpkg_divert(*rh.divert_args("--add"))
-        self.assertEqual(seen["cmd"], ["/usr/bin/dpkg-divert", "--local", "--rename", "--divert",
-                                       rh.KALI_LOGIN_BG + ".tenfold-tweak", "--add", rh.KALI_LOGIN_BG])
+        self.assertEqual(seen["cmd"], ["/usr/bin/dpkg-divert", "--package", "tenfold-tweaks", "--rename", "--divert",
+                                       rh.KALI_LOGIN_BG + ".tenfold-tweaks", "--add", rh.KALI_LOGIN_BG])
         self.assertNotIn("HOME", seen["env"])
 
     def test_divert_failure_reason(self):
@@ -187,7 +189,7 @@ class KaliRealShapeTest(Sandbox):
         self.stock_bytes = read(STOCK)
         root = os.path.join(self.d, "root", "usr", "share")
         bg = os.path.join(root, "desktop-base", "kali-theme", "login", "background-blurred")
-        paths = {"KALI_LOGIN_BG": bg, "KALI_LOGIN_BG_DIVERTED": bg + ".tenfold-tweak"}
+        paths = {"KALI_LOGIN_BG": bg, "KALI_LOGIN_BG_DIVERTED": bg + ".tenfold-tweaks"}
         p = mock.patch.multiple(rh, **paths)
         p.start()
         self.addCleanup(p.stop)
@@ -308,7 +310,7 @@ class KaliDivertStateTest(KaliGdmTest):
         os.unlink(self.p["KALI_LOGIN_BG_DIVERTED"])  # dpkg deletes the diverted file on purge
         self.assertEqual(rh.gdm_restore(), rh.EXIT_OK)
         self.assertFalse(self.fake.diverted)
-        self.assertFalse(os.path.lexists(self.p["KALI_LOGIN_BG"]))
+        self.assertEqual(read(self.p["KALI_LOGIN_BG"]), read(self.png))  # only copy left: never an empty path
         self.assertFalse(os.path.exists(self.marker()))
 
     def test_rollback_keeps_preexisting_diversion(self):
@@ -376,6 +378,42 @@ class KaliDivertStateTest(KaliGdmTest):
         self.assertTrue(self.fake.diverted)
         self.assertEqual(rh.gdm_restore(), rh.EXIT_OK)  # a later restore still works
         self.assertOriginalBack()
+
+    def fail_restore_after_rename(self):
+        # dpkg-divert --rename --remove renames the stock back before its db write fails (ENOSPC/IO/kill).
+        def remove_renames_then_fails(*args):
+            out = self.fake(*args)
+            if "--remove" in args:
+                self.fake.diverted = True
+                raise rh.HelperError("dpkg-divert failed: No space left on device")
+            return out
+        rh.gdm_apply(self.png)
+        with mock.patch.object(rh, "dpkg_divert", remove_renames_then_fails):
+            with self.assertRaises(rh.HelperError):
+                rh.gdm_restore()
+        self.assertTrue(os.path.islink(self.p["KALI_LOGIN_BG"]))
+        self.assertTrue(self.fake.diverted)
+
+    def assertStockBackImageRescued(self):
+        self.assertOriginalBack()
+        self.assertEqual(read(self.original), b"\xff\xd8\xff kali")
+        self.assertFalse(os.path.lexists(self.p["KALI_LOGIN_BG"] + rh.RESTORE_SUFFIX))
+        [name] = os.listdir(self.p["RESCUE_DIR"])
+        self.assertEqual(read(os.path.join(self.p["RESCUE_DIR"], name)), read(self.png))
+
+    def test_restore_retry_after_rename_then_db_failure_keeps_stock_and_image(self):
+        self.fail_restore_after_rename()
+        self.assertEqual(rh.gdm_restore(), rh.EXIT_OK)
+        self.assertStockBackImageRescued()
+
+    def test_pkg_remove_after_rename_then_db_failure_keeps_stock_and_image(self):
+        self.fail_restore_after_rename()
+
+        def divert(*args):
+            return rh.PKG if args[0] == "--listpackage" else self.fake(*args)
+        with mock.patch.object(rh, "dpkg_divert", divert), redirect_stdout(io.StringIO()):
+            self.assertEqual(rh.pkg_remove(), rh.EXIT_OK)
+        self.assertStockBackImageRescued()
 
     def test_apply_succeeds_even_if_old_theme_revert_errors(self):
         with mock.patch.object(rh, "gdm_gresource_restore", side_effect=OSError(5, "I/O error")):

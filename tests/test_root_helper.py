@@ -16,7 +16,7 @@ SYSTEM_THEME = "/usr/share/gnome-shell/gnome-shell-theme.gresource"
 
 def _stock_fixture() -> str:
     # The installed theme may already be patched by a real run; then use the tool's stock backup.
-    for path in (SYSTEM_THEME, "/var/lib/tenfold-tweak/gnome-shell-theme.gresource.orig"):
+    for path in (SYSTEM_THEME, rh.GRESOURCE_ORIG):
         try:
             if not rh.is_patched(rh.read_gresource(path)):
                 return path
@@ -57,16 +57,17 @@ class Sandbox(unittest.TestCase):
         paths = {
             "STATE_DIR": self.state,
             "GRESOURCE": os.path.join(share, "gnome-shell-theme.gresource"),
-            "GRESOURCE_NEW": os.path.join(share, ".gnome-shell-theme.gresource.new"),
+            "GRESOURCE_NEW": os.path.join(share, ".tenfold-tweaks-gnome-shell-theme.gresource.new"),
             "GRESOURCE_ORIG": os.path.join(self.state, "gnome-shell-theme.gresource.orig"),
             "GRESOURCE_META": os.path.join(self.state, "gnome-shell-theme.meta"),
             "LIGHTDM_CONF": os.path.join(self.d, "etc", "lightdm-gtk-greeter.conf"),
             "LIGHTDM_ORIG": os.path.join(self.state, "lightdm-gtk-greeter.conf.orig"),
-            "LIGHTDM_IMAGE_DIR": os.path.join(self.d, "usr-local", "backgrounds", "tenfold-tweak"),
+            "LIGHTDM_IMAGE_DIR": os.path.join(self.state, "lightdm"),
             # No Kali shell override by default: these tests cover the gresource method.
             "SHELL_LIBS": os.path.join(self.d, "usr-lib", "libshell-*.so"),
             "KALI_LOGIN_BG": os.path.join(self.d, "kali-login", "background-blurred"),
-            "KALI_LOGIN_BG_DIVERTED": os.path.join(self.d, "kali-login", "background-blurred.tenfold-tweak"),
+            "KALI_LOGIN_BG_DIVERTED": os.path.join(self.d, "kali-login", "background-blurred.tenfold-tweaks"),
+            "RESCUE_DIR": os.path.join(self.d, "var-backups"),
             "DPKG_DIVERT": os.path.join(self.d, "no-such-dpkg-divert"),
         }
         self.p = paths
@@ -153,7 +154,7 @@ class GdmTest(Sandbox):
         entries = self.installed()
         self.assertNotIn(rh.LOGIN_ENTRY + "png", entries)
         self.assertEqual(entries[rh.LOGIN_ENTRY + "jpg"], read(self.jpg))
-        self.assertEqual(entries[rh.THEME_PREFIX + "gnome-shell-dark.css"].count(b"tenfold-tweak */"), 1)
+        self.assertEqual(entries[rh.THEME_PREFIX + "gnome-shell-dark.css"].count(b"tenfold-tweaks */"), 1)
         self.assertEqual(read(self.p["GRESOURCE_ORIG"]), self.stock_bytes)
 
     def test_restore_is_byte_identical_then_nothing_to_restore(self):

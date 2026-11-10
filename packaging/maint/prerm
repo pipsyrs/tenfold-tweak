@@ -1,0 +1,23 @@
+#!/bin/sh
+# tenfold-tweaks prerm: save the active login images and restore the stock login screen; failure aborts the remove.
+set -e
+
+#COMMON#
+
+case "$1" in
+    remove)
+        if [ ! -x "$TT_R$TT_HELPER" ]; then
+            tt_die "$TT_HELPER is missing; reinstall tenfold-tweaks, then remove it again"
+        fi
+        if ! "$TT_R$TT_HELPER" pkg-remove; then
+            tt_die "the login screen could not be restored safely; the package stays installed"
+        fi
+        ;;
+    upgrade | deconfigure | failed-upgrade) ;;
+    *)
+        echo "prerm called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,13 @@
+Package: tenfold-tweaks
+Version: @VERSION@
+Architecture: all
+Maintainer: Tenfold Tweaks <tenfold-tweaks@localhost>
+Installed-Size: @SIZE@
+Depends: python3 (>= 3.10), python3-gi, gir1.2-gdkpixbuf-2.0, gir1.2-gtk-4.0, pkexec | policykit-1, dpkg (>= 1.19.2)
+Recommends: gir1.2-adw-1
+Section: utils
+Priority: optional
+Description: change desktop, lock screen and login screen backgrounds
+ Sets the desktop, lock screen and login screen (GDM, Kali GDM, LightDM)
+ backgrounds from the command line or a GTK 4 dashboard, with restore to
+ the stock images. Admin rights are asked only for the login screen.

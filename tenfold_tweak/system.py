@@ -1,22 +1,23 @@
 """Runs the root helper through pkexec and maps its exit codes to results."""
 
 import configparser
+import json
 import os
 import stat
 import subprocess
 
-# Only this root-owned copy (installed by install.sh) is ever run through pkexec.
-HELPER = "/usr/local/lib/tenfold-tweak/tenfold_tweak/root_helper.py"
-INSTALL_HINT = "run: sudo ./install.sh"
+# Only this root-owned copy (installed by the .deb) is ever run through pkexec.
+HELPER = "/usr/libexec/tenfold-tweaks/root-helper"
+INSTALL_HINT = "sudo apt install ./tenfold-tweaks_*.deb"
 PKEXEC = "/usr/bin/pkexec"
 PYTHON = "/usr/bin/python3"
 ACTIONS = ("gdm-apply", "gdm-restore", "lightdm-apply", "lightdm-restore")
 
-INSTALL_LIB = os.path.dirname(os.path.dirname(HELPER))
+INSTALL_LIB = "/usr/share/tenfold-tweaks"
+# Login images saved by package removal (root_helper.RESCUE_DIR).
+RESCUE_DIR = "/var/backups/tenfold-tweaks"
 # Directory holding the tenfold_tweak package in use (source tree or INSTALL_LIB).
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-SH = "/bin/sh"
-SETUP_TIMEOUT = 600
 
 
 def helper_problem(path: str | None = None) -> str | None:
@@ -46,7 +47,7 @@ def run_helper(action: str, image: str | None = None) -> tuple:
     """Return (status, reason) with status in applied|skipped|failed."""
     if action not in ACTIONS:
         raise ValueError(f"unknown helper action {action}")
-    cmd = [PKEXEC, PYTHON, "-I", HELPER, action]
+    cmd = [PKEXEC, HELPER, action]
     if action.endswith("-apply"):
         if not image or not os.path.isabs(image):
             raise ValueError("helper apply needs an absolute image path")
@@ -66,6 +67,42 @@ def run_helper(action: str, image: str | None = None) -> tuple:
         return "skipped", "authorization cancelled"
     lines = [ln for ln in proc.stderr.strip().splitlines() if ln.strip()]
     return "failed", lines[-1].strip() if lines else f"helper exited with {proc.returncode}"
+
+
+def run_clean(ids: list, expect: str | None = None) -> dict:
+    """Run the helper's `clean` once; {id: {status, freed, removed, skipped, reason}} for every id."""
+    def every(status, reason):
+        return {i: {"status": status, "freed": 0, "removed": 0, "skipped": {"in-use": 0, "other-fs": 0},
+                    "reason": reason} for i in ids}
+
+    if not ids:
+        return {}
+    cmd = [PKEXEC, HELPER, "clean", *ids] + (["--expect-autoremove", expect] if expect else [])
+    problem = helper_problem()
+    if problem:
+        return every("skipped", f"unsupported: {problem}")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as e:
+        return every("failed", f"cannot run pkexec: {e.strerror}")
+    if proc.returncode in (126, 127):
+        return every("skipped", "admin cancelled")
+    lines = [ln for ln in proc.stderr.strip().splitlines() if ln.strip()]
+    if proc.returncode != 0:
+        return every("failed", lines[-1].strip() if lines else f"helper exited with {proc.returncode}")
+    try:
+        results = json.loads(proc.stdout.strip().splitlines()[-1])["results"]
+    except (ValueError, IndexError, KeyError, TypeError):
+        return every("failed", "unreadable result from the root helper")
+    out = every("failed", "no result from the root helper")
+    for i in ids:
+        r = results.get(i) if isinstance(results, dict) else None
+        if isinstance(r, dict) and r.get("status") in ("cleaned", "skipped", "failed"):
+            skipped = r.get("skipped") if isinstance(r.get("skipped"), dict) else {}
+            out[i] = {"status": r["status"], "freed": int(r.get("freed") or 0), "removed": int(r.get("removed") or 0),
+                      "skipped": {k: int(skipped.get(k) or 0) for k in ("in-use", "other-fs")},
+                      "reason": str(r.get("reason") or "")}
+    return out
 
 
 def login_status(dm: str) -> dict:
@@ -94,7 +131,17 @@ def login_status(dm: str) -> dict:
     return {"method": "", "current": None, "restorable": False}
 
 
-# ---------- one-time system setup (install.sh through pkexec) ----------
+def saved_login_images() -> list:
+    """Login images saved in RESCUE_DIR by an earlier package removal; read-only."""
+    try:
+        names = sorted(os.listdir(RESCUE_DIR))
+    except OSError:
+        return []
+    paths = [os.path.join(RESCUE_DIR, n) for n in names if not n.startswith(".")]
+    return [p for p in paths if os.path.isfile(p) and not os.path.islink(p)]
+
+
+# ---------- installed package state ----------
 
 def running_installed() -> bool:
     return PROJECT_DIR == INSTALL_LIB
@@ -112,33 +159,13 @@ def helper_outdated() -> bool:
 
 
 def setup_problem() -> str | None:
-    """Why the login target needs the one-time admin setup (no CLI hint); None when ready."""
+    """Why the login target needs the tenfold-tweaks package (re)installed (no CLI hint); None when ready."""
     problem = helper_problem()
     if problem:
         if not os.path.lexists(HELPER):
-            return "login-screen support is not set up yet (one-time administrator setup)"
+            return "login-screen support is not installed (install the tenfold-tweaks package)"
         return problem.removesuffix("; " + INSTALL_HINT) + " (reinstall needed)"
     if helper_outdated():
         return "login-screen support is outdated (reinstall needed)"
     return None
 
-
-def install_script(for_uninstall: bool = False) -> str | None:
-    """install.sh to run as root: the root-owned installed copy for uninstall, else the source tree's."""
-    candidates = [os.path.join(INSTALL_LIB, "install.sh")] if for_uninstall else []
-    if not running_installed():
-        candidates.append(os.path.join(PROJECT_DIR, "install.sh"))
-    for path in candidates:
-        if not os.path.islink(path) and os.path.isfile(path):
-            return path
-    return None
-
-
-def run_install_script(script: str, args: list) -> tuple:
-    """Run install.sh as root via pkexec; returns (returncode, stdout, stderr). Blocks."""
-    if not os.path.isabs(script) or any(a not in ("--discard-login", "--uninstall") for a in args):
-        raise ValueError("invalid install.sh invocation")
-    # Fixed argv, no shell string: pkexec authenticates the admin, then sh runs the script.
-    proc = subprocess.run([PKEXEC, SH, script, *args], capture_output=True, text=True,
-                          timeout=SETUP_TIMEOUT, stdin=subprocess.DEVNULL)
-    return proc.returncode, proc.stdout, proc.stderr

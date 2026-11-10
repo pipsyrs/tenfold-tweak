@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Tenfold Tweaks
+Comment=Change desktop, lock screen and login screen backgrounds
+Exec=tenfold-tweaks gui
+Icon=preferences-desktop-wallpaper
+Terminal=false
+StartupWMClass=tenfold-tweaks
+Categories=Settings;DesktopSettings;
