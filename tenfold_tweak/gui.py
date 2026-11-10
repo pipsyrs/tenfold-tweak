@@ -2,6 +2,8 @@
 
 import os
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -45,7 +47,7 @@ def usable(st) -> bool:
 def card_actions(st, pending: bool, busy: bool) -> dict:
     """Which card buttons are enabled."""
     live = usable(st) and not busy
-    return {"choose": live, "apply": live and pending, "setup": needs_setup(st) and not busy,
+    return {"choose": live, "apply": live and pending,
             "restore": st.available and not busy and st.restorable}
 
 
@@ -472,7 +474,7 @@ class TargetCard:
         setup = needs_setup(st)
         self.restore_btn.set_visible(not setup)  # nothing to restore before setup
         self.setup_btn.set_visible(setup)
-        self.setup_btn.set_sensitive(acts["setup"])
+        self.setup_btn.set_sensitive(setup and not busy)
         if setup and not self.pending:
             self.setup_btn.add_css_class("suggested-action")
         else:
@@ -1036,7 +1038,7 @@ class Dashboard:
 
     def _ask(self, message: str, finish):
         heading, body = confirm_text(message)
-        self.ask(heading, body, "_Continue", message == core.GDM_WARNING, finish)
+        Dashboard.ask(self, heading, body, "_Continue", message == core.GDM_WARNING, finish)  # real method, not a mocked attr
 
     def ask(self, heading: str, body: str, accept: str, risky: bool, finish):
         """Modal yes/no; finish(True) only when `accept` is chosen."""
@@ -1089,6 +1091,8 @@ def build_app(use_adw: bool = True):
                 Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
             Gtk.Window.set_default_icon_name("preferences-desktop-wallpaper")
             state["dash"] = Dashboard(a)
+            if state.get("on_mapped"):  # free the launching terminal once the window shows
+                _on_first_map(state["dash"].window, state["on_mapped"])
         state["dash"].window.present()
 
     app.connect("activate", on_activate)
@@ -1118,9 +1122,114 @@ def _report_error(message: str):
             pass
 
 
+def _detach_requested() -> bool:
+    """True when we were launched from a controlling terminal worth freeing."""
+    try:
+        fd = os.open(os.ctermid(), os.O_RDONLY | os.O_NOCTTY)  # fails with no controlling tty
+    except OSError:
+        return False  # menu/.desktop launch: nothing to free
+    os.close(fd)
+    return True
+
+
+_READY_ENV = "TENFOLD_TWEAK_READY_FD"  # fd the relaunched child signals on at first map
+
+
+def _wait_for_child():
+    """Relaunch self detached, hold the terminal until its window maps, then exit."""
+    try:
+        r, w = os.pipe()
+    except OSError:
+        return  # stay attached, as before
+    if r <= 2 or w <= 2:  # stdio was closed at launch: pipe collides with 0-2
+        os.close(r)
+        os.close(w)
+        return  # stay attached
+    try:
+        child = subprocess.Popen([sys.executable, *sys.orig_argv[1:]], start_new_session=True,
+                                 pass_fds=(w,), env={**os.environ, _READY_ENV: str(w)})
+    except (OSError, subprocess.SubprocessError):
+        os.close(r)
+        os.close(w)
+        return  # spawn failed: stay attached
+    os.close(w)
+    try:
+        try:
+            ready = os.read(r, 1)
+        except OSError:
+            ready = b""
+        os.close(r)
+        if ready:
+            os._exit(0)  # window shown; free the prompt, GUI keeps running detached
+        code = child.wait()  # child died first: mirror it
+    except KeyboardInterrupt:  # Ctrl+C before map: abort the startup too
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        child.terminate()
+        child.wait()
+        os._exit(130)
+    os._exit(128 - code if code < 0 else code)
+
+
+def _detach_after_map():
+    """Relaunch in a new session so the launching terminal is freed once the window maps.
+
+    The relaunched child gets finish(), to call from the window's first "map"; this
+    process holds the terminal until then and exits. None: nothing to detach from.
+    Runs before any GTK/GLib starts threads (fork after that deadlocks GDBus).
+    """
+    fd = os.environ.pop(_READY_ENV, None)
+    if fd is None:
+        if _detach_requested():
+            _wait_for_child()  # parent: exits, unless the relaunch could not start
+        return None
+    try:
+        w = int(fd)  # relaunched child: own session, terminal stderr kept until map
+        if w <= 2 or not stat.S_ISFIFO(os.fstat(w).st_mode):
+            return None  # stale/foreign value: run attached
+        os.set_inheritable(w, False)  # nothing the child spawns inherits it
+    except (ValueError, OverflowError, OSError):
+        return None  # not our pipe: run attached
+
+    def finish():
+        for std in (sys.stdout, sys.stderr):
+            try:
+                std.flush()
+            except (OSError, ValueError):
+                pass
+        try:
+            null = os.open(os.devnull, os.O_RDWR)  # stop writing to the freed terminal
+            for target in (0, 1, 2):
+                os.dup2(null, target)
+            if null > 2:
+                os.close(null)
+        except OSError:
+            pass
+        try:
+            os.write(w, b"\x01")  # tell the parent the window is up
+        finally:
+            os.close(w)
+
+    return finish
+
+
+def _on_first_map(window, callback):
+    """Run callback once, the first time the window is mapped on screen."""
+    seen = []
+
+    def handler(_w):
+        if not seen:
+            seen.append(True)
+            callback()
+
+    window.connect("map", handler)
+
+
 def main() -> int:
+    finish = _detach_after_map()  # first, before GLib threads: parent waits for the window
     app, error = build_app()
     if error:
         _report_error(error)
         return 2
+    if finish is not None:
+        app.state["on_mapped"] = finish
     return app.run([])

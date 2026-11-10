@@ -110,11 +110,225 @@ class NoticeCommandTest(unittest.TestCase):
 
     def test_main_reports_to_stderr_when_toolkit_missing(self):
         with mock.patch.object(gui, "build_app", return_value=(None, "GTK 4 missing")), \
+                mock.patch.object(gui, "_detach_after_map", return_value=None), \
                 mock.patch.object(gui.sys, "stderr") as err, mock.patch.object(gui.subprocess, "run") as run:
             err.isatty.return_value = True
             self.assertEqual(gui.main(), 2)
         self.assertIn("GTK 4 missing", "".join(c.args[0] for c in err.write.call_args_list))
         run.assert_not_called()
+
+
+class DetachDecisionTest(unittest.TestCase):
+    """The has-tty / should-detach decision (unit-testable without a display)."""
+
+    def test_detaches_with_controlling_terminal(self):
+        with mock.patch.object(gui.os, "open", return_value=7) as op, \
+                mock.patch.object(gui.os, "close") as cl:
+            self.assertTrue(gui._detach_requested())
+        op.assert_called_once()
+        cl.assert_called_once_with(7)
+
+    def test_no_detach_without_controlling_terminal(self):
+        with mock.patch.object(gui.os, "open", side_effect=OSError):
+            self.assertFalse(gui._detach_requested())
+
+
+class _Exit(Exception):
+    """Stands in for os._exit so the parent branch can be observed."""
+
+
+class DetachForkTest(unittest.TestCase):
+    """_detach_after_map relaunch/pipe logic, with os.* and Popen mocked (no real spawn)."""
+
+    def setUp(self):
+        env = mock.patch.dict(gui.os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        gui.os.environ.pop(gui._READY_ENV, None)  # we are the launching (parent) process
+
+    def _parent(self, read=b"\x01", code=0):
+        calls = []
+        child = mock.Mock()
+        child.wait.return_value = code
+        with mock.patch.object(gui, "_detach_requested", return_value=True), \
+                mock.patch.object(gui.os, "pipe", return_value=(10, 11)), \
+                mock.patch.object(gui.subprocess, "Popen", return_value=child) as po, \
+                mock.patch.object(gui.os, "close", side_effect=lambda fd: calls.append(("close", fd))), \
+                mock.patch.object(gui.os, "read", side_effect=lambda fd, n: calls.append(("read", fd))
+                                  or (read() if callable(read) else read)), \
+                mock.patch.object(gui.os, "_exit", side_effect=_Exit) as ex:
+            with self.assertRaises(_Exit):
+                gui._detach_after_map()
+        return calls, child, ex, po
+
+    def test_relaunch_in_new_session_with_ready_fd(self):
+        _, _, _, po = self._parent()
+        kw = po.call_args.kwargs
+        self.assertEqual(po.call_args.args[0][0], gui.sys.executable)
+        self.assertTrue(kw["start_new_session"])
+        self.assertEqual(kw["pass_fds"], (11,))
+        self.assertEqual(kw["env"][gui._READY_ENV], "11")
+        self.assertNotIn("stderr", kw)  # child keeps the terminal for startup errors
+
+    def test_parent_closes_write_end_before_blocking(self):
+        calls, _, _, _ = self._parent()
+        self.assertLess(calls.index(("close", 11)), calls.index(("read", 10)))
+
+    def test_parent_exits_zero_once_window_mapped(self):
+        _, child, ex, _ = self._parent(read=b"\x01")
+        ex.assert_called_once_with(0)
+        child.wait.assert_not_called()
+
+    def test_parent_mirrors_child_exit_code_when_child_dies_first(self):
+        _, child, ex, _ = self._parent(read=b"", code=2)
+        child.wait.assert_called_once()
+        ex.assert_called_once_with(2)
+
+    def test_parent_uses_128_plus_signal_when_child_killed(self):
+        _, _, ex, _ = self._parent(read=b"", code=-9)  # SIGKILL
+        ex.assert_called_once_with(137)
+
+    def test_parent_read_error_falls_back_to_wait(self):
+        def boom():
+            raise OSError
+        _, child, ex, _ = self._parent(read=boom, code=0)
+        child.wait.assert_called_once()
+        ex.assert_called_once_with(0)
+
+    def test_ctrl_c_before_map_terminates_child_and_exits_130(self):
+        def interrupt():
+            raise KeyboardInterrupt
+        with mock.patch.object(gui.signal, "signal"):
+            _, child, ex, _ = self._parent(read=interrupt)
+        child.terminate.assert_called_once()
+        child.wait.assert_called_once()
+        ex.assert_called_once_with(130)
+
+    def test_no_tty_no_relaunch(self):
+        with mock.patch.object(gui, "_detach_requested", return_value=False), \
+                mock.patch.object(gui.subprocess, "Popen") as po:
+            self.assertIsNone(gui._detach_after_map())
+        po.assert_not_called()
+
+    def test_spawn_failure_closes_pipe_and_stays_attached(self):
+        with mock.patch.object(gui, "_detach_requested", return_value=True), \
+                mock.patch.object(gui.os, "pipe", return_value=(10, 11)), \
+                mock.patch.object(gui.subprocess, "Popen", side_effect=OSError), \
+                mock.patch.object(gui.os, "close") as cl, \
+                mock.patch.object(gui.os, "_exit") as ex:
+            self.assertIsNone(gui._detach_after_map())
+        ex.assert_not_called()
+        self.assertEqual(sorted(c.args[0] for c in cl.call_args_list), [10, 11])
+
+    def test_parent_pipe_on_stdio_fd_no_relaunch(self):
+        with mock.patch.object(gui, "_detach_requested", return_value=True), \
+                mock.patch.object(gui.os, "pipe", return_value=(0, 3)), \
+                mock.patch.object(gui.subprocess, "Popen") as po, \
+                mock.patch.object(gui.os, "close") as cl, \
+                mock.patch.object(gui.os, "_exit") as ex:
+            self.assertIsNone(gui._detach_after_map())
+        po.assert_not_called()
+        ex.assert_not_called()
+        self.assertEqual(sorted(c.args[0] for c in cl.call_args_list), [0, 3])
+
+    def _child(self, value, fstat=None):
+        gui.os.environ[gui._READY_ENV] = value
+        fstat = fstat or mock.Mock(return_value=mock.Mock(st_mode=gui.stat.S_IFIFO | 0o600))
+        with mock.patch.object(gui.subprocess, "Popen") as po, \
+                mock.patch.object(gui.os, "fstat", fstat), \
+                mock.patch.object(gui.os, "set_inheritable") as inh, \
+                mock.patch.object(gui.os, "write") as wr:
+            finish = gui._detach_after_map()
+        po.assert_not_called()  # never relaunches from the child side
+        wr.assert_not_called()
+        self.assertNotIn(gui._READY_ENV, gui.os.environ)
+        return finish, inh
+
+    def test_child_non_int_fd_runs_attached(self):
+        finish, inh = self._child("abc")
+        self.assertIsNone(finish)
+        inh.assert_not_called()
+
+    def test_child_stdio_fd_runs_attached(self):
+        for value in ("2", "0", "-1"):
+            finish, inh = self._child(value)
+            self.assertIsNone(finish)
+            inh.assert_not_called()
+
+    def test_child_non_fifo_fd_runs_attached(self):
+        regular = mock.Mock(return_value=mock.Mock(st_mode=gui.stat.S_IFREG | 0o600))
+        finish, inh = self._child("11", fstat=regular)
+        self.assertIsNone(finish)
+        inh.assert_not_called()
+
+    def test_child_closed_fd_runs_attached(self):
+        finish, inh = self._child("11", fstat=mock.Mock(side_effect=OSError))
+        self.assertIsNone(finish)
+        inh.assert_not_called()
+
+    def test_child_valid_fd_made_non_inheritable(self):
+        finish, inh = self._child("11")
+        self.assertIsNotNone(finish)
+        inh.assert_called_once_with(11, False)
+
+    def test_child_finish_redirects_and_signals(self):
+        gui.os.environ[gui._READY_ENV] = "11"
+        fifo = mock.Mock(st_mode=gui.stat.S_IFIFO | 0o600)
+        with mock.patch.object(gui.subprocess, "Popen") as po, \
+                mock.patch.object(gui.os, "fstat", return_value=fifo), \
+                mock.patch.object(gui.os, "set_inheritable"), \
+                mock.patch.object(gui.os, "close") as cl, \
+                mock.patch.object(gui.os, "open", return_value=20), \
+                mock.patch.object(gui.os, "dup2") as dup, \
+                mock.patch.object(gui.os, "write") as wr:
+            finish = gui._detach_after_map()
+            po.assert_not_called()  # the relaunched child never relaunches again
+            self.assertNotIn(gui._READY_ENV, gui.os.environ)  # not leaked to helpers
+            wr.assert_not_called()  # nothing signalled before the window maps
+            finish()
+        self.assertEqual([c.args for c in dup.call_args_list], [(20, 0), (20, 1), (20, 2)])
+        wr.assert_called_once_with(11, b"\x01")
+        cl.assert_any_call(11)
+
+
+class FirstMapTest(unittest.TestCase):
+    def test_callback_runs_only_on_first_map(self):
+        window, cb = mock.Mock(), mock.Mock()
+        gui._on_first_map(window, cb)
+        handler = window.connect.call_args.args[1]
+        self.assertEqual(window.connect.call_args.args[0], "map")
+        handler(window)
+        handler(window)  # hidden and re-shown
+        cb.assert_called_once()
+
+
+class MainDetachWiringTest(unittest.TestCase):
+    def test_detaches_before_toolkit_and_startup_failure_exits_2(self):
+        order, fin = [], mock.Mock()
+        with mock.patch.object(gui, "build_app", side_effect=lambda: order.append("build") or (None, "boom")), \
+                mock.patch.object(gui, "_report_error") as rep, \
+                mock.patch.object(gui, "_detach_after_map", side_effect=lambda: order.append("detach") or fin):
+            self.assertEqual(gui.main(), 2)
+        self.assertEqual(order, ["detach", "build"])  # relaunch before any GLib thread exists
+        rep.assert_called_once_with("boom")
+        fin.assert_not_called()  # parent is not told "ready": it mirrors exit 2
+
+    def test_child_gets_map_hook_before_run(self):
+        app = mock.Mock(state={})
+        app.run.side_effect = lambda argv: self.assertIn("on_mapped", app.state) or 0
+        fin = mock.Mock()
+        with mock.patch.object(gui, "build_app", return_value=(app, None)), \
+                mock.patch.object(gui, "_detach_after_map", return_value=fin):
+            self.assertEqual(gui.main(), 0)
+        self.assertIs(app.state["on_mapped"], fin)
+
+    def test_no_tty_runs_unchanged(self):
+        app = mock.Mock(state={})
+        app.run.return_value = 0
+        with mock.patch.object(gui, "build_app", return_value=(app, None)), \
+                mock.patch.object(gui, "_detach_after_map", return_value=None):
+            self.assertEqual(gui.main(), 0)
+        self.assertNotIn("on_mapped", app.state)
 
 
 class WorkerSafetyTest(unittest.TestCase):
